@@ -1,0 +1,39 @@
+{
+  "description": "hive-memory adapter: captures Claude Code session events into the hive-memory MCP server",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "HIVE_MEMORY_DB=/root/hive-memory/hive-memory.db node /root/hive-memory/adapters/claude-code/capture.js SessionStart", "timeout": 10 }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "HIVE_MEMORY_DB=/root/hive-memory/hive-memory.db node /root/hive-memory/adapters/claude-code/context-inject.js", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "HIVE_MEMORY_DB=/root/hive-memory/hive-memory.db node /root/hive-memory/adapters/claude-code/capture.js UserPromptSubmit", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "HIVE_MEMORY_DB=/root/hive-memory/hive-memory.db node /root/hive-memory/adapters/claude-code/capture.js PostToolUse", "timeout": 10, "async": true }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "HIVE_MEMORY_DB=/root/hive-memory/hive-memory.db node /root/hive-memory/adapters/claude-code/capture.js Stop", "timeout": 10, "async": true }
+        ]
+      }
+    ]
+  }
+}

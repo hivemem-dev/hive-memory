@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      { "command": "node /root/hive-memory/adapters/cursor/capture.js beforeSubmitPrompt" }
+    ],
+    "afterShellExecution": [
+      { "command": "node /root/hive-memory/adapters/cursor/capture.js afterShellExecution" }
+    ],
+    "afterFileEdit": [
+      { "command": "node /root/hive-memory/adapters/cursor/capture.js afterFileEdit" }
+    ],
+    "stop": [
+      { "command": "node /root/hive-memory/adapters/cursor/capture.js stop" }
+    ]
+  }
+}
