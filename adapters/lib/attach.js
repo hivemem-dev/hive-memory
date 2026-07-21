@@ -15,11 +15,19 @@ const CLAUDE_CODE_MARKER = 'hive-memory/adapters/claude-code/capture.js';
 const CURSOR_MARKER = 'hive-memory/adapters/cursor/capture.js';
 const CODEX_MARKER = '[mcp_servers.hive-memory]';
 
+// No HIVE_MEMORY_PROJECT here on purpose - hardcoding hive-memory's own
+// install directory as the default "project" was itself a real bug (every
+// user who attached Codex this way ended up with their memory scoped to
+// hive-memory's install path instead of whatever they actually work on).
+// Falling back to server.js's own default (HIVE_MEMORY_PROJECT || cwd) means
+// it scopes to wherever the Codex CLI was launched from, same as any other
+// cwd-scoped tool - correct for the common case, and callers who want a
+// fixed project can still set HIVE_MEMORY_PROJECT themselves (see README).
 const CODEX_BLOCK =
   '[mcp_servers.hive-memory]\n' +
   'command = "node"\n' +
   'args = ["/root/hive-memory/server.js"]\n' +
-  'env = { HIVE_MEMORY_AGENT = "codex", HIVE_MEMORY_PROJECT = "/root/hive-memory" }\n';
+  'env = { HIVE_MEMORY_AGENT = "codex" }\n';
 
 function readJson(filePath) {
   try {

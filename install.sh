@@ -15,13 +15,20 @@ cat <<EOF
       "command": "node",
       "args": ["$SCRIPT_DIR/server.js"],
       "env": {
-        "HIVE_MEMORY_AGENT": "claude-code",
-        "HIVE_MEMORY_PROJECT": "$SCRIPT_DIR"
+        "HIVE_MEMORY_AGENT": "claude-code"
       }
     }
   }
 }
 EOF
+echo
+echo "That leaves HIVE_MEMORY_PROJECT unset, so memory scopes to whatever"
+echo "directory each session runs from (fine if each project is its own repo)."
+echo "If you want ALL memory in one fixed scope regardless of cwd, add"
+echo "\"HIVE_MEMORY_PROJECT\": \"/path/you/choose\" to the env above - and make"
+echo "sure it matches the HIVE_MEMORY_PROJECT you pass to the hook commands"
+echo "written by 'cli.js attach', or search and capture will silently look at"
+echo "two different projects."
 echo
 echo "Then restart Claude Code."
 echo

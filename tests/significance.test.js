@@ -131,6 +131,15 @@ function countMemoryRows(dbPath) {
   }
 }
 
+function readMemoryRows(dbPath) {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return db.prepare('SELECT project, value FROM memory').all();
+  } finally {
+    db.close();
+  }
+}
+
 test('capture.js integration: significant PostToolUse (Edit) is written to memory', async (t) => {
   const dbPath = path.join(os.tmpdir(), `hive-memory-sig-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
   t.after(() => {
@@ -178,4 +187,124 @@ test('capture.js integration: insignificant PostToolUse (Read, no error) is NOT 
   assert.match(stdout, /"continue":true/);
 
   assert.ok(!fs.existsSync(dbPath), 'no db file should have been created for an insignificant event');
+});
+
+test('capture.js integration: Bash PostToolUse captures the real command, not just the tool name', async (t) => {
+  const dbPath = path.join(os.tmpdir(), `hive-memory-sig-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  t.after(() => {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        fs.unlinkSync(dbPath + suffix);
+      } catch {
+        // ignore missing files
+      }
+    }
+  });
+
+  const env = { ...process.env, HIVE_MEMORY_AGENT: 'sig-test', HIVE_MEMORY_PROJECT: '/test-project', HIVE_MEMORY_DB: dbPath };
+
+  await runCapture(CLAUDE_CODE_CAPTURE, env, {
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: 'npm test' },
+    cwd: '/test-project',
+  });
+
+  const rows = readMemoryRows(dbPath);
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].value, /npm test/, 'the actual command should be in the stored value, not just "Bash"');
+});
+
+test('capture.js integration: Edit PostToolUse captures the file path', async (t) => {
+  const dbPath = path.join(os.tmpdir(), `hive-memory-sig-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  t.after(() => {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        fs.unlinkSync(dbPath + suffix);
+      } catch {
+        // ignore missing files
+      }
+    }
+  });
+
+  const env = { ...process.env, HIVE_MEMORY_AGENT: 'sig-test', HIVE_MEMORY_PROJECT: '/test-project', HIVE_MEMORY_DB: dbPath };
+
+  await runCapture(CLAUDE_CODE_CAPTURE, env, {
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Edit',
+    tool_input: { file_path: '/repo/src/index.js' },
+    cwd: '/test-project',
+  });
+
+  const rows = readMemoryRows(dbPath);
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].value, /\/repo\/src\/index\.js/, 'the edited file path should be in the stored value');
+});
+
+test('capture.js integration: Stop captures the last assistant message from the transcript, not the bare word "Stop"', async (t) => {
+  const dbPath = path.join(os.tmpdir(), `hive-memory-sig-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  const transcriptPath = path.join(os.tmpdir(), `hive-memory-transcript-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+  t.after(() => {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        fs.unlinkSync(dbPath + suffix);
+      } catch {
+        // ignore missing files
+      }
+    }
+    try {
+      fs.unlinkSync(transcriptPath);
+    } catch {
+      // ignore
+    }
+  });
+
+  fs.writeFileSync(transcriptPath, [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'fix the bug' }] } }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Fixed the off-by-one error in the pagination loop.' }] } }),
+  ].join('\n'));
+
+  const env = { ...process.env, HIVE_MEMORY_AGENT: 'sig-test', HIVE_MEMORY_PROJECT: '/test-project', HIVE_MEMORY_DB: dbPath };
+
+  await runCapture(CLAUDE_CODE_CAPTURE, env, {
+    hook_event_name: 'Stop',
+    transcript_path: transcriptPath,
+    cwd: '/test-project',
+  });
+
+  const rows = readMemoryRows(dbPath);
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].value, /off-by-one error in the pagination loop/, 'should capture the real last assistant message');
+  assert.doesNotMatch(rows[0].value, /^Stop$/, 'must not be the bare event name');
+});
+
+test('capture.js integration: HIVE_MEMORY_PROJECT stays fixed even when event.cwd differs (regression: cwd used to fragment memory into one bucket per directory)', async (t) => {
+  const dbPath = path.join(os.tmpdir(), `hive-memory-sig-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  t.after(() => {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        fs.unlinkSync(dbPath + suffix);
+      } catch {
+        // ignore missing files
+      }
+    }
+  });
+
+  const env = { ...process.env, HIVE_MEMORY_AGENT: 'sig-test', HIVE_MEMORY_PROJECT: '/stable-project', HIVE_MEMORY_DB: dbPath };
+
+  await runCapture(CLAUDE_CODE_CAPTURE, env, {
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: 'ls' },
+    cwd: '/some/transient/subdir/that/changed',
+  });
+
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const rows = db.prepare('SELECT project FROM memory').all();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].project, '/stable-project', 'HIVE_MEMORY_PROJECT must win over event.cwd');
+  } finally {
+    db.close();
+  }
 });
