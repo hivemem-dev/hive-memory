@@ -1,8 +1,19 @@
 # hive-memory
 
-MCP server for personal + shared memory that works with any MCP-compatible agent (Claude Code, Cursor, Codex CLI, ...). Personal entries are visible only to the agent that wrote them; shared entries are visible to every agent connected to the same project. Search is full-text (SQLite FTS5), ranked by past outcome (`success`/`failure`) and recall count.
+MCP server for personal + shared memory that works with any MCP-compatible agent (Claude Code, Cursor, Codex CLI, ...). Personal entries are visible only to the agent that wrote them; shared entries are visible to every agent connected to the same project. Search is hybrid — SQLite FTS5 keyword matching fused with local, offline semantic search (see below) — ranked by past outcome (`success`/`failure`) and recall count.
 
-Four MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `memory_stats`.
+Five MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `memory_stats`, `memory_recall_recent`.
+
+## Semantic recall
+
+`memory_recall` combines two search methods and merges them with reciprocal rank fusion, so a fact surfaces whether the query shares its exact words or just its meaning:
+
+- **Keyword (FTS5)** — exact/prefix word matches, same as before.
+- **Semantic (local embeddings)** — [@huggingface/transformers](https://www.npmjs.com/package/@huggingface/transformers) running `Xenova/all-MiniLM-L6-v2` fully on-CPU/offline. No API key, no per-call cost — only a one-time ~90MB model download on first use (cached under `~/.cache`).
+
+This only runs in the long-lived MCP server session (the one wired into the agent's `mcpServers` config) — the hook-capture path (`adapters/*/capture.js`) spawns a fresh process per event and sets `HIVE_MEMORY_LIGHTWEIGHT=1` to skip embedding there, so hook latency is unaffected. Any backlog of un-embedded rows (legacy entries, or ones written through the lightweight path) gets embedded lazily the next time `memory_recall` runs.
+
+If the model can't load (e.g. no internet on first run), recall falls back to keyword-only search instead of failing.
 
 ## Quick start
 
@@ -58,6 +69,8 @@ screen -dmS hive-memory-watcher node --max-old-space-size=64 watcher.js
 ## Environment variables
 
 See `.env.example`: `HIVE_MEMORY_AGENT`, `HIVE_MEMORY_PROJECT`, `HIVE_MEMORY_DB`.
+
+**Set `HIVE_MEMORY_PROJECT` explicitly if you want one stable memory scope.** If unset, the Claude Code/Cursor hook adapters fall back to the hook event's current working directory - fine if each of your projects is its own repo/cwd, but if a session ever `cd`s elsewhere (a subprocess, a temp folder, a nested app dir), that becomes a brand-new, disconnected memory bucket. Pin `HIVE_MEMORY_PROJECT` in your hook commands and in your MCP server's `env` (must match) to keep everything under one project regardless of cwd drift.
 
 ## Tests
 

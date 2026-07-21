@@ -17,7 +17,11 @@ const TIMEOUT_MS = 10000;
 // same process/handshake mechanics, different tool name/args.
 function callMcpTool({ agent, project }, toolName, toolArgs) {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env, HIVE_MEMORY_AGENT: agent };
+    // These hook-triggered calls spawn a fresh server.js per event and must
+    // stay fast - HIVE_MEMORY_LIGHTWEIGHT skips embedding computation there
+    // (see server.js). The persistent MCP server used for real searches
+    // isn't spawned through this helper, so it's unaffected.
+    const env = { ...process.env, HIVE_MEMORY_AGENT: agent, HIVE_MEMORY_LIGHTWEIGHT: '1' };
     if (project) env.HIVE_MEMORY_PROJECT = project;
 
     const child = spawn('node', [SERVER_PATH], { env, stdio: ['pipe', 'pipe', 'ignore'] });

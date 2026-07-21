@@ -11,6 +11,16 @@ const { summarize } = require('./lib/compress');
 const AGENT = process.env.HIVE_MEMORY_AGENT || 'unknown-agent';
 const PROJECT = process.env.HIVE_MEMORY_PROJECT || process.cwd();
 
+// The hook-capture adapters spawn a brand-new `node server.js` process for
+// every single event (SessionStart/UserPromptSubmit/PostToolUse/Stop) - see
+// adapters/lib/remember.js. Computing an embedding there would mean loading
+// the local model from scratch dozens of times per session, adding
+// multi-second latency to hook events that must stay fast (some of them are
+// not backgrounded and directly delay the next prompt). Only the persistent
+// MCP server session (the one wired into the agent's own mcpServers config,
+// which loads the model once and reuses it) does embedding work.
+const LIGHTWEIGHT = process.env.HIVE_MEMORY_LIGHTWEIGHT === '1';
+
 const server = new Server(
   { name: 'hive-memory', version: '0.1.0' },
   { capabilities: { tools: {} } }
@@ -86,12 +96,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       key: args.key,
       value: cleaned,
     });
+    if (!LIGHTWEIGHT) {
+      // Best-effort: a fact is still safely stored even if embedding fails
+      // (e.g. first run with no internet to fetch the local model yet).
+      try {
+        await memory.embedAndStore(result.id, cleaned);
+      } catch (err) {
+        console.error('hive-memory: embedding failed for new entry, keyword search still works:', err.message);
+      }
+    }
     const action = result.deduped ? 'Reinforced existing entry' : 'Stored new entry';
     return { content: [{ type: 'text', text: `${action} (id ${result.id}, scope ${args.scope || 'personal'})` }] };
   }
 
   if (name === 'memory_recall') {
-    const rows = memory.recall({
+    const recallFn = LIGHTWEIGHT ? memory.recall : memory.recallHybrid;
+    const rows = await recallFn({
       query: args.query,
       project: PROJECT,
       scope: args.scope,

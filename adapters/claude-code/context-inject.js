@@ -27,7 +27,8 @@ process.stdin.on('end', async () => {
     // non-JSON or empty stdin - nothing to key the lookup on
   }
 
-  const project = event.cwd || process.env.HIVE_MEMORY_PROJECT;
+  // Same fixed-project priority as capture.js - see the comment there.
+  const project = process.env.HIVE_MEMORY_PROJECT || event.cwd;
 
   try {
     const result = await recallRecentViaMcp({ agent: 'claude-code', project, limit: 20 });

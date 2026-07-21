@@ -8,6 +8,12 @@ const DB_PATH = process.env.HIVE_MEMORY_DB || path.join(process.cwd(), 'hive-mem
 // touch stored data, only how recall() orders results.
 const HALF_LIFE_DAYS = 30;
 
+// Local semantic search: this model runs fully offline/on-CPU via
+// @huggingface/transformers, no API key and no per-call cost (only a
+// one-time ~90MB model download, cached under ~/.cache). Keeps hive-memory
+// free to run as often as the hooks fire.
+const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
+
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
@@ -55,6 +61,13 @@ CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
 END;
 `);
 
+// Migration: add the embedding column to DBs created before semantic search
+// existed. ALTER TABLE has no IF NOT EXISTS form, so guard with table_info.
+const memoryCols = db.prepare('PRAGMA table_info(memory)').all().map(c => c.name);
+if (!memoryCols.includes('embedding')) {
+  db.exec('ALTER TABLE memory ADD COLUMN embedding BLOB');
+}
+
 function normalize(text) {
   return text.trim().toLowerCase().replace(/\s+/g, ' ');
 }
@@ -97,6 +110,9 @@ function remember({ scope, agent, project, key, value }) {
   return { id: info.lastInsertRowid, deduped: false };
 }
 
+// Builds the scope/project/agent visibility filter shared by recall(),
+// recallRecent() and semanticCandidates() - kept in one place so the three
+// read paths can never drift out of sync on who can see what.
 // admin=true drops the personal/global agent-isolation filter entirely (but
 // keeps project scoping for personal/shared, and keeps global project-
 // agnostic). Only meant for the human-facing cli.js search command, where
@@ -105,47 +121,72 @@ function remember({ scope, agent, project, key, value }) {
 // data they could already read straight out of the SQLite file. Never used
 // by the MCP server (agents always pass their real `agent`, admin stays
 // false there).
-function recall({ query, project, scope, agent, limit = 10, admin = false }) {
-  let sql = `
-    SELECT m.id, m.scope, m.agent, m.key, m.value, m.outcome, m.times_recalled, m.created_at
-    FROM memory_fts f
-    JOIN memory m ON m.id = f.rowid
-    WHERE memory_fts MATCH ?
-  `;
-  const ftsQuery = query.trim().split(/\s+/).map(w => `${w}*`).join(' ');
-  const params = [ftsQuery];
-
+function visibilityClause({ scope, project, agent, admin }) {
   if (scope === 'global') {
     // global entries aren't tied to a project: this agent's global entries
     // are visible no matter which project is asking.
-    sql += admin ? ' AND m.scope = ?' : ' AND m.scope = ? AND m.agent = ?';
-    params.push('global');
-    if (!admin) params.push(agent);
-  } else if (scope) {
-    sql += ' AND m.project = ? AND m.scope = ?';
-    params.push(project, scope);
-  } else if (admin) {
-    sql += ` AND ((m.project = ? AND m.scope IN ('shared', 'personal')) OR m.scope = 'global')`;
-    params.push(project);
-  } else {
-    sql += ` AND (
-      (m.project = ? AND (m.scope = 'shared' OR (m.scope = 'personal' AND m.agent = ?)))
-      OR (m.scope = 'global' AND m.agent = ?)
-    )`;
-    params.push(project, agent, agent);
+    return admin
+      ? { sql: 'm.scope = ?', params: ['global'] }
+      : { sql: 'm.scope = ? AND m.agent = ?', params: ['global', agent] };
   }
-
-  sql += " ORDER BY m.outcome = 'success' DESC, decay_score(m.times_recalled, m.updated_at) DESC, rank LIMIT ?";
-  params.push(limit);
-
-  const rows = db.prepare(sql).all(...params);
-
-  if (rows.length > 0) {
-    const ids = rows.map(r => r.id);
-    const placeholders = ids.map(() => '?').join(',');
-    db.prepare(`UPDATE memory SET times_recalled = times_recalled + 1 WHERE id IN (${placeholders})`).run(...ids);
+  if (scope) {
+    return { sql: 'm.project = ? AND m.scope = ?', params: [project, scope] };
   }
+  if (admin) {
+    return {
+      sql: `(m.project = ? AND m.scope IN ('shared', 'personal')) OR m.scope = 'global'`,
+      params: [project],
+    };
+  }
+  return {
+    sql: `(m.project = ? AND (m.scope = 'shared' OR (m.scope = 'personal' AND m.agent = ?))) OR (m.scope = 'global' AND m.agent = ?)`,
+    params: [project, agent, agent],
+  };
+}
 
+function touchRows(ids) {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`UPDATE memory SET times_recalled = times_recalled + 1 WHERE id IN (${placeholders})`).run(...ids);
+}
+
+// FTS5's default operator between space-separated terms is AND - a query
+// only matches if EVERY word is present. Fine for one word, brittle for
+// several (one word not appearing verbatim kills the whole search). Try the
+// strict AND match first (most precise); if that finds nothing, retry with
+// OR so a partial word-overlap still surfaces something instead of zero.
+function buildFtsQueries(query) {
+  const words = query.trim().split(/\s+/).filter(Boolean).map(w => `${w.toLowerCase()}*`);
+  return { and: words.join(' '), or: words.join(' OR ') };
+}
+
+function runFtsQuery(matchQuery, visibility, limit) {
+  const sql = `
+    SELECT m.id, m.scope, m.agent, m.key, m.value, m.outcome, m.times_recalled, m.created_at
+    FROM memory_fts f
+    JOIN memory m ON m.id = f.rowid
+    WHERE memory_fts MATCH ? AND (${visibility.sql})
+    ORDER BY m.outcome = 'success' DESC, decay_score(m.times_recalled, m.updated_at) DESC, rank
+    LIMIT ?
+  `;
+  return db.prepare(sql).all(matchQuery, ...visibility.params, limit);
+}
+
+// Keyword-match candidates only, no side effects (doesn't touch
+// times_recalled) - the building block shared by recall() and recallHybrid().
+function ftsCandidates({ query, project, scope, agent, limit = 10, admin = false }) {
+  const visibility = visibilityClause({ scope, project, agent, admin });
+  const { and, or } = buildFtsQueries(query);
+  let rows = runFtsQuery(and, visibility, limit);
+  if (rows.length === 0 && and !== or) {
+    rows = runFtsQuery(or, visibility, limit);
+  }
+  return rows;
+}
+
+function recall({ query, project, scope, agent, limit = 10, admin = false }) {
+  const rows = ftsCandidates({ query, project, scope, agent, limit, admin });
+  touchRows(rows.map(r => r.id));
   return rows;
 }
 
@@ -165,6 +206,124 @@ function recallRecent({ project, agent, limit = 20 }) {
   return db.prepare(sql).all(project, agent, agent, limit);
 }
 
+// --- Semantic search (local, free, offline - see EMBEDDING_MODEL above) ---
+
+let embedderPromise = null;
+function getEmbedder() {
+  if (!embedderPromise) {
+    const { pipeline } = require('@huggingface/transformers');
+    embedderPromise = pipeline('feature-extraction', EMBEDDING_MODEL);
+  }
+  return embedderPromise;
+}
+
+async function embedText(text) {
+  const embedder = await getEmbedder();
+  const output = await embedder(text, { pooling: 'mean', normalize: true });
+  return Float32Array.from(output.data);
+}
+
+// Float32Array <-> BLOB. Copies through a fresh typed array on both ends
+// instead of viewing the raw buffer/Node Buffer directly - sqlite BLOBs and
+// pooled Node Buffers aren't guaranteed 4-byte aligned, which a live view
+// would silently get wrong.
+function vectorToBuffer(vec) {
+  return Buffer.from(Float32Array.from(vec).buffer);
+}
+
+function bufferToVector(buf) {
+  return new Float32Array(Uint8Array.from(buf).buffer);
+}
+
+function cosineSimilarity(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+function storeEmbedding(id, vec) {
+  db.prepare('UPDATE memory SET embedding = ? WHERE id = ?').run(vectorToBuffer(vec), id);
+}
+
+async function embedAndStore(id, text) {
+  const vec = await embedText(text);
+  storeEmbedding(id, vec);
+  return vec;
+}
+
+// Fills in embeddings for rows written before semantic search existed, or
+// written via the lightweight hook path (see server.js HIVE_MEMORY_LIGHTWEIGHT)
+// which skips embedding to keep hook latency near zero. Idempotent and safe
+// to call on every recall - a no-op once the backlog is caught up. Stops
+// quietly (not a thrown error) if the model can't load, e.g. first run with
+// no internet to fetch it - plain keyword search still works either way.
+async function backfillEmbeddings({ batchLimit = 200 } = {}) {
+  const rows = db.prepare('SELECT id, value FROM memory WHERE embedding IS NULL LIMIT ?').all(batchLimit);
+  let done = 0;
+  for (const row of rows) {
+    try {
+      const vec = await embedText(row.value);
+      storeEmbedding(row.id, vec);
+      done++;
+    } catch (err) {
+      break;
+    }
+  }
+  return done;
+}
+
+function semanticCandidates({ queryVec, project, scope, agent, limit = 10, admin = false }) {
+  const visibility = visibilityClause({ scope, project, agent, admin });
+  const sql = `
+    SELECT m.id, m.scope, m.agent, m.key, m.value, m.outcome, m.times_recalled, m.created_at, m.embedding
+    FROM memory m
+    WHERE (${visibility.sql}) AND m.embedding IS NOT NULL
+  `;
+  const rows = db.prepare(sql).all(...visibility.params);
+  const scored = rows.map(r => ({ ...r, similarity: cosineSimilarity(queryVec, bufferToVector(r.embedding)) }));
+  scored.sort((a, b) => b.similarity - a.similarity);
+  return scored.slice(0, limit).map(({ embedding, similarity, ...rest }) => rest);
+}
+
+// Combines keyword search (FTS5) with meaning-based search (local embedding
+// cosine similarity) via reciprocal rank fusion: each ranked list contributes
+// 1/(60+rank) per hit, so a fact only one method finds still surfaces, and
+// one found by both ranks highest. Falls back to keyword-only if the
+// embedding model can't load - never hard-fails a search over it.
+async function recallHybrid({ query, project, scope, agent, limit = 10, admin = false }) {
+  const poolSize = Math.max(limit * 4, 20);
+  const ftsRows = ftsCandidates({ query, project, scope, agent, limit: poolSize, admin });
+
+  let semRows = [];
+  try {
+    await backfillEmbeddings();
+    const queryVec = await embedText(query);
+    semRows = semanticCandidates({ queryVec, project, scope, agent, limit: poolSize, admin });
+  } catch (err) {
+    console.error('hive-memory: semantic recall unavailable, falling back to keyword-only:', err.message);
+  }
+
+  const RRF_K = 60;
+  const fused = new Map();
+  ftsRows.forEach((row, i) => fused.set(row.id, { row, score: 1 / (RRF_K + i + 1) }));
+  semRows.forEach((row, i) => {
+    const add = 1 / (RRF_K + i + 1);
+    const existing = fused.get(row.id);
+    if (existing) existing.score += add;
+    else fused.set(row.id, { row, score: add });
+  });
+
+  const merged = [...fused.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+  const rows = merged.map(m => m.row);
+  touchRows(rows.map(r => r.id));
+  return rows;
+}
+
 function markOutcome({ id, outcome }) {
   db.prepare('UPDATE memory SET outcome = ?, updated_at = ? WHERE id = ?').run(outcome, Date.now(), id);
   return { ok: true };
@@ -174,7 +333,8 @@ function stats({ project }) {
   const total = db.prepare('SELECT COUNT(*) as n FROM memory WHERE project = ?').get(project);
   const byScope = db.prepare('SELECT scope, COUNT(*) as n FROM memory WHERE project = ? GROUP BY scope').all(project);
   const latest = db.prepare('SELECT value, created_at FROM memory WHERE project = ? ORDER BY created_at DESC LIMIT 1').get(project);
-  return { total: total.n, byScope, latest };
+  const embedded = db.prepare('SELECT COUNT(*) as n FROM memory WHERE project = ? AND embedding IS NOT NULL').get(project);
+  return { total: total.n, byScope, latest, embedded: embedded.n };
 }
 
 // Unfiltered admin listing for the human operator via cli.js. No agent
@@ -202,4 +362,16 @@ function listAll({ project, scope, agent, limit = 50 } = {}) {
   return db.prepare(sql).all(...params);
 }
 
-module.exports = { remember, recall, recallRecent, markOutcome, stats, listAll, DB_PATH };
+module.exports = {
+  remember,
+  recall,
+  recallRecent,
+  recallHybrid,
+  backfillEmbeddings,
+  embedText,
+  embedAndStore,
+  markOutcome,
+  stats,
+  listAll,
+  DB_PATH,
+};

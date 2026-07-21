@@ -1,6 +1,6 @@
 {
   "name": "hive-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Universal MCP memory server: personal + shared memory across any MCP-compatible agent",
   "main": "server.js",
   "bin": {
@@ -10,7 +10,11 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^11.0.0"
+  },
+  "overrides": {
+    "adm-zip": "^0.6.0"
   }
 }
