@@ -10,9 +10,35 @@ const HALF_LIFE_DAYS = 30;
 
 // Local semantic search: this model runs fully offline/on-CPU via
 // @huggingface/transformers, no API key and no per-call cost (only a
-// one-time ~90MB model download, cached under ~/.cache). Keeps hive-memory
-// free to run as often as the hooks fire.
-const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
+// one-time model download, cached under node_modules/.../.cache). Keeps
+// hive-memory free to run as often as the hooks fire.
+//
+// EmbeddingGemma over the previous Xenova/all-MiniLM-L6-v2: measured on this
+// installation's own captured Russian conversation history (node cli.js
+// verify), MiniLM found the right past answer again only 30% of the time
+// (semantic-only, top-5) vs 70% for EmbeddingGemma - MiniLM is
+// English-centric and was missing most Russian matches. Costs ~1.2GB on
+// disk / model load vs MiniLM's ~90MB - only worth it because this install
+// has the RAM headroom for it.
+const EMBEDDING_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
+
+// EmbeddingGemma is trained asymmetrically - queries and stored documents
+// need different prompt prefixes to get good similarity scores (see the
+// model card). Getting this wrong doesn't error, it just silently produces
+// worse rankings, so it's applied unconditionally rather than left optional.
+const QUERY_PREFIX = 'task: search result | query: ';
+const PASSAGE_PREFIX = 'title: none | text: ';
+
+// Second-pass reranker: the embedding/FTS search above is a fast, rough
+// first sort (a librarian grabbing 20 books that look roughly right off the
+// shelf) - this model does a slower, careful second read, comparing the
+// query against each candidate directly rather than just comparing two
+// pre-computed vectors, and re-sorts by that. int8-quantized BGE reranker
+// (multilingual, includes Russian) - measured on this installation's real
+// data: scored the correct past answer at 0.999 vs -9.5 to -10.6 for
+// unrelated ones, a wide and reliable margin. ~560MB on disk/load, on top
+// of the embedding model - only worth it with RAM to spare.
+const RERANKER_MODEL = 'tss-deposium/bge-reranker-v2-m3-onnx-int8';
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -95,6 +121,13 @@ CREATE TABLE IF NOT EXISTS skills (
   UNIQUE(agent, project, scope, name)
 );
 
+-- Tiny settings store, currently just tracking which embedding model
+-- produced the stored vectors (see the migration below).
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   value, key, content='memory', content_rowid='id'
 );
@@ -128,6 +161,20 @@ if (!memoryCols.includes('embedding')) {
 // every pre-existing row to 'fact' either way.
 if (!memoryCols.includes('type')) {
   db.exec("ALTER TABLE memory ADD COLUMN type TEXT NOT NULL DEFAULT 'fact'");
+}
+
+// A stored embedding is only meaningful relative to the model that produced
+// it - vectors from two different models have incompatible dimensions/
+// geometry, and comparing them (see cosineSimilarity) would silently return
+// garbage similarity scores instead of erroring. So: remember which model
+// wrote the current embeddings, and if EMBEDDING_MODEL has changed since,
+// wipe them all - backfillEmbeddings() lazily regenerates them under the
+// new model on the next recall, same as a fresh row.
+const storedModel = db.prepare("SELECT value FROM meta WHERE key = 'embedding_model'").get();
+if (!storedModel || storedModel.value !== EMBEDDING_MODEL) {
+  db.exec('UPDATE memory SET embedding = NULL WHERE embedding IS NOT NULL');
+  db.prepare("INSERT INTO meta (key, value) VALUES ('embedding_model', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .run(EMBEDDING_MODEL);
 }
 
 function normalize(text) {
@@ -231,12 +278,28 @@ function buildFtsQueries(query) {
   return { and: words.join(' '), or: words.join(' OR ') };
 }
 
+// key IN ('UserPromptSubmit', 'PostToolUse') rows are the hook adapter's raw
+// process capture (see adapters/claude-code/capture.js) - what the user
+// typed, or which shell command ran - neither is ever the *answer* to a
+// question. Left in the candidate pool, UserPromptSubmit rows in particular
+// crowd real answers out of the top-K (a re-asked question's closest match
+// is almost always another stored question, not its answer) - measured via
+// `node cli.js verify`: excluding them raised the real-answer hit rate from
+// 3% to 13% on this installation's own history. They're still stored and
+// still visible via `node cli.js search`/`list` for a human - this only
+// excludes them from being a *recall result*.
+// IS NULL branch matters: most rows (anything written via memory_remember/
+// memory_convention/etc.) have key = NULL, and in SQL `NULL NOT IN (...)`
+// evaluates to NULL (not true) - a bare `m.key NOT IN (...)` would silently
+// exclude every NULL-key row too, not just the noisy ones.
+const EXCLUDE_PROMPTS_CLAUSE = "(m.key IS NULL OR m.key NOT IN ('UserPromptSubmit', 'PostToolUse'))";
+
 function runFtsQuery(matchQuery, visibility, limit) {
   const sql = `
     SELECT m.id, m.scope, m.agent, m.key, m.value, m.type, m.outcome, m.times_recalled, m.created_at
     FROM memory_fts f
     JOIN memory m ON m.id = f.rowid
-    WHERE memory_fts MATCH ? AND (${visibility.sql})
+    WHERE memory_fts MATCH ? AND (${visibility.sql}) AND ${EXCLUDE_PROMPTS_CLAUSE}
     ORDER BY m.type = 'convention' DESC, m.outcome = 'success' DESC, decay_score(m.times_recalled, m.updated_at) DESC, rank
     LIMIT ?
   `;
@@ -288,9 +351,13 @@ function getEmbedder() {
   return embedderPromise;
 }
 
-async function embedText(text) {
+// isQuery picks which of EmbeddingGemma's two prompt prefixes to use (see
+// QUERY_PREFIX/PASSAGE_PREFIX above) - a search query and a stored fact are
+// embedded with different prefixes on purpose, per the model's training.
+async function embedText(text, { isQuery = false } = {}) {
   const embedder = await getEmbedder();
-  const output = await embedder(text, { pooling: 'mean', normalize: true });
+  const prefixed = (isQuery ? QUERY_PREFIX : PASSAGE_PREFIX) + text;
+  const output = await embedder(prefixed, { pooling: 'mean', normalize: true });
   return Float32Array.from(output.data);
 }
 
@@ -353,7 +420,7 @@ function semanticCandidates({ queryVec, project, scope, agent, limit = 10, admin
   const sql = `
     SELECT m.id, m.scope, m.agent, m.key, m.value, m.type, m.outcome, m.times_recalled, m.created_at, m.embedding
     FROM memory m
-    WHERE (${visibility.sql}) AND m.embedding IS NOT NULL
+    WHERE (${visibility.sql}) AND m.embedding IS NOT NULL AND ${EXCLUDE_PROMPTS_CLAUSE}
   `;
   const rows = db.prepare(sql).all(...visibility.params);
   const scored = rows.map(r => ({ ...r, similarity: cosineSimilarity(queryVec, bufferToVector(r.embedding)) }));
@@ -361,11 +428,53 @@ function semanticCandidates({ queryVec, project, scope, agent, limit = 10, admin
   return scored.slice(0, limit).map(({ embedding, similarity, ...rest }) => rest);
 }
 
+// --- Reranker (local, free, offline - see RERANKER_MODEL above) ---
+
+let rerankerPromise = null;
+function getReranker() {
+  if (!rerankerPromise) {
+    const { AutoTokenizer, AutoModelForSequenceClassification } = require('@huggingface/transformers');
+    rerankerPromise = Promise.all([
+      AutoTokenizer.from_pretrained(RERANKER_MODEL),
+      AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL, { dtype: 'int8' }),
+    ]);
+  }
+  return rerankerPromise;
+}
+
+// Re-sorts `rows` by how well each one actually answers `query`, scored one
+// pair at a time (query, row.value) rather than by comparing two
+// pre-computed vectors - slower, but far more accurate at telling a real
+// answer apart from something merely topic-adjacent (see RERANKER_MODEL
+// comment for measured numbers). Returns rows unchanged, in their original
+// order, if the model can't load - reranking is a quality improvement on
+// top of recallHybrid's fused order, never a hard requirement for it.
+async function rerank(query, rows) {
+  if (rows.length === 0) return rows;
+  try {
+    const [tokenizer, model] = await getReranker();
+    const scored = [];
+    for (const row of rows) {
+      const inputs = tokenizer([query], { text_pair: [row.value], padding: true, truncation: true });
+      const { logits } = await model(inputs);
+      scored.push({ row, score: logits.data[0] });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map(s => s.row);
+  } catch (err) {
+    console.error('hive-memory: reranker unavailable, keeping fused search order:', err.message);
+    return rows;
+  }
+}
+
 // Combines keyword search (FTS5) with meaning-based search (local embedding
 // cosine similarity) via reciprocal rank fusion: each ranked list contributes
 // 1/(60+rank) per hit, so a fact only one method finds still surfaces, and
 // one found by both ranks highest. Falls back to keyword-only if the
-// embedding model can't load - never hard-fails a search over it.
+// embedding model can't load - never hard-fails a search over it. The fused
+// pool is then reranked (see rerank() above) before being cut down to
+// `limit` - fusion picks a rough top pool fast, the reranker picks the best
+// few out of that pool carefully.
 async function recallHybrid({ query, project, scope, agent, limit = 10, admin = false }) {
   const poolSize = Math.max(limit * 4, 20);
   const ftsRows = ftsCandidates({ query, project, scope, agent, limit: poolSize, admin });
@@ -373,7 +482,7 @@ async function recallHybrid({ query, project, scope, agent, limit = 10, admin = 
   let semRows = [];
   try {
     await backfillEmbeddings();
-    const queryVec = await embedText(query);
+    const queryVec = await embedText(query, { isQuery: true });
     semRows = semanticCandidates({ queryVec, project, scope, agent, limit: poolSize, admin });
   } catch (err) {
     console.error('hive-memory: semantic recall unavailable, falling back to keyword-only:', err.message);
@@ -389,8 +498,9 @@ async function recallHybrid({ query, project, scope, agent, limit = 10, admin = 
     else fused.set(row.id, { row, score: add });
   });
 
-  const merged = [...fused.values()].sort((a, b) => b.score - a.score).slice(0, limit);
-  const rows = merged.map(m => m.row);
+  const pool = [...fused.values()].sort((a, b) => b.score - a.score).slice(0, poolSize).map(m => m.row);
+  const reranked = await rerank(query, pool);
+  const rows = reranked.slice(0, limit);
   touchRows(rows.map(r => r.id));
   return rows;
 }
@@ -546,10 +656,20 @@ async function premortem({ query, project, scope, agent, limit = 8, admin = fals
 // Auto-generates a ground-truth test set from real history instead of hand-
 // written fixtures: every captured UserPromptSubmit row that's a real
 // question (long enough to be substantive) is paired with whichever Stop
-// row landed right after it (same agent/project, next few ids - PostToolUse
-// rows are usually interspersed between them). This gives "if I ask this
-// again, does recall find the answer I got last time" pairs for free, drawn
-// from what this exact installation has actually been asked.
+// row landed right after it (same agent/project - PostToolUse rows are
+// usually interspersed between them, that's fine). This gives "if I ask
+// this again, does recall find the answer I got last time" pairs for free,
+// drawn from what this exact installation has actually been asked.
+//
+// The candidate Stop must land before the user's *next* prompt, not just
+// within a fixed id window - otherwise a prompt with no clean single-turn
+// reply (the topic moved on before a Stop fired) could get paired with a
+// Stop that actually answers a *later* question, producing a fixture whose
+// "ground truth" answer is simply wrong. MAX_WINDOW is a backstop for the
+// rare case for the very last prompt in history in a large PostToolUse
+// batch, not the primary boundary.
+const MAX_ANSWER_WINDOW = 20;
+
 function extractQaFixtures({ project, agent, sampleSize = 20 }) {
   const prompts = db.prepare(`
     SELECT id, value FROM memory
@@ -560,11 +680,21 @@ function extractQaFixtures({ project, agent, sampleSize = 20 }) {
   const fixtures = [];
   for (const p of prompts) {
     if (fixtures.length >= sampleSize) break;
+
+    const nextPrompt = db.prepare(`
+      SELECT id FROM memory
+      WHERE project = ? AND agent = ? AND key = 'UserPromptSubmit' AND id > ?
+      ORDER BY id ASC LIMIT 1
+    `).get(project, agent, p.id);
+    const upperBound = nextPrompt
+      ? Math.min(nextPrompt.id - 1, p.id + MAX_ANSWER_WINDOW)
+      : p.id + MAX_ANSWER_WINDOW;
+
     const answer = db.prepare(`
       SELECT id, value FROM memory
       WHERE project = ? AND agent = ? AND key = 'Stop' AND id > ? AND id <= ?
       ORDER BY id ASC LIMIT 1
-    `).get(project, agent, p.id, p.id + 8);
+    `).get(project, agent, p.id, upperBound);
     if (!answer) continue;
     fixtures.push({
       questionId: p.id,
@@ -663,6 +793,7 @@ module.exports = {
   backfillEmbeddings,
   embedText,
   embedAndStore,
+  rerank,
   markOutcome,
   correctMemory,
   touchMemory,

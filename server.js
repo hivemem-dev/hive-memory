@@ -22,7 +22,7 @@ const PROJECT = process.env.HIVE_MEMORY_PROJECT || process.cwd();
 const LIGHTWEIGHT = process.env.HIVE_MEMORY_LIGHTWEIGHT === '1';
 
 const server = new Server(
-  { name: 'hive-memory', version: '0.5.0' },
+  { name: 'hive-memory', version: '0.7.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -46,7 +46,10 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string' },
+        query: {
+          type: 'string',
+          description: 'Write this yourself, do not paste the user\'s raw message verbatim - expand abbreviations, fix likely typos, and state the actual topic in plain terms. A clean query matches stored facts far better than the user\'s literal phrasing.',
+        },
         scope: { type: 'string', enum: ['personal', 'shared'] },
         limit: { type: 'number', default: 10 },
       },
@@ -200,7 +203,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', description: 'Short description of the action about to be taken' },
+        action: { type: 'string', description: 'Short, clear description of the action about to be taken, in your own words - not a copy-paste of the user\'s raw message.' },
         limit: { type: 'number', default: 8 },
       },
       required: ['action'],

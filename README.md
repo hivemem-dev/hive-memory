@@ -22,11 +22,13 @@ Sixteen MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `m
 `memory_recall` combines two search methods and merges them with reciprocal rank fusion, so a fact surfaces whether the query shares its exact words or just its meaning:
 
 - **Keyword (FTS5)** — exact/prefix word matches, same as before.
-- **Semantic (local embeddings)** — [@huggingface/transformers](https://www.npmjs.com/package/@huggingface/transformers) running `Xenova/all-MiniLM-L6-v2` fully on-CPU/offline. No API key, no per-call cost — only a one-time ~90MB model download on first use (cached under `~/.cache`).
+- **Semantic (local embeddings)** — [@huggingface/transformers](https://www.npmjs.com/package/@huggingface/transformers) running `onnx-community/embeddinggemma-300m-ONNX` fully on-CPU/offline. No API key, no per-call cost — only a one-time ~1.2GB model download on first use (cached under `node_modules/@huggingface/transformers/.cache`). Chosen over the smaller `Xenova/all-MiniLM-L6-v2` (previously used) specifically for Russian: measured 70% vs 30% top-5 hit rate on a clean benchmark - see CHANGELOG 0.6.0. Switching `EMBEDDING_MODEL` in `db.js` auto-invalidates old stored vectors on next start (see `meta` table), so mixing models never silently corrupts similarity scores.
 
 This only runs in the long-lived MCP server session (the one wired into the agent's `mcpServers` config) — the hook-capture path (`adapters/*/capture.js`) spawns a fresh process per event and sets `HIVE_MEMORY_LIGHTWEIGHT=1` to skip embedding there, so hook latency is unaffected. Any backlog of un-embedded rows (legacy entries, or ones written through the lightweight path) gets embedded lazily the next time `memory_recall` runs.
 
 If the model can't load (e.g. no internet on first run), recall falls back to keyword-only search instead of failing.
+
+**Reranking.** After keyword+semantic fusion produces a rough top pool, a second model (`RERANKER_MODEL` in `db.js`, `tss-deposium/bge-reranker-v2-m3-onnx-int8`, ~560MB) scores the query against each candidate directly and re-sorts before the pool is cut down to the requested `limit`. This is slower per call than the fusion step alone but meaningfully more accurate - measured on this installation's real data, it scored the correct past answer at 0.999 vs -9.5 to -10.6 for unrelated candidates. Falls back to the fusion order unchanged if the reranker can't load.
 
 ## Quick start
 
@@ -91,10 +93,12 @@ See `.env.example`: `HIVE_MEMORY_AGENT`, `HIVE_MEMORY_PROJECT`, `HIVE_MEMORY_DB`
 node cli.js verify [--project X] [--agent X] [--sample N] [--k N]
 ```
 
-Builds a ground-truth test set automatically from real history - every captured `UserPromptSubmit` that's a real question, paired with whichever `Stop` row answered it - then re-asks each question as a `memory_recall` query and checks whether the real past answer comes back in the top-K. Reports three numbers: the raw hybrid-search hit rate as shipped, the same search with other stored questions filtered out as noise (an upper bound - the fix isn't built yet), and a bare chronological recent-N dump (the closest thing to "no real retrieval"). No memory at all is 0% by construction.
+Builds a ground-truth test set automatically from real history - every captured `UserPromptSubmit` that's a real question, paired with whichever `Stop` row answered it before the next question was asked - then re-asks each question as a `memory_recall` query and checks whether the real past answer comes back in the top-K. Reports the hybrid-search hit rate as shipped, the same search restricted to `key='Stop'` rows only (a diagnostic ceiling), and a bare chronological recent-N dump (the closest thing to "no real retrieval"). No memory at all is 0% by construction. See CHANGELOG for the measured history: 3% → 33% after switching embedding models, excluding raw prompt/tool-call rows from being recall results, fixing the benchmark's own fixture pairing, and adding a reranker.
 
 ## Tests
 
 ```bash
-node --test tests/
+npm test
 ```
+
+Runs `node --test --test-concurrency=1 tests/*.test.js`. Concurrency is pinned to 1 on purpose - the embedding model (~1.2GB) and reranker (~560MB) both get loaded fresh per spawned `server.js` process, and running many test files in parallel (Node's default) can exceed available RAM on a modest VPS and get processes OOM-killed mid-test. Slower (~90s vs ~45s), but reliable.

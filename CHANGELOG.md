@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0 — reranker, query-clarity guidance, and fixed fixture pairing
+
+- **Added: reranker.** After keyword+semantic fusion produces a rough candidate pool, `tss-deposium/bge-reranker-v2-m3-onnx-int8` (~560MB, multilingual) scores the query against each candidate directly and re-sorts before cutting down to the requested limit. Falls back to the fusion order unchanged if it can't load.
+- **Changed: `memory_recall`/`memory_premortem` tool descriptions now instruct the calling agent to write a clear, expanded query itself instead of pasting the user's raw message** - free (no extra API call, the calling agent already writes the tool call), and the query text matters a lot for a system this dependent on keyword/semantic overlap.
+- **Fixed: `EXCLUDE_PROMPTS_CLAUSE` now also excludes `key='PostToolUse'` rows** (shell commands / tool calls), not just `UserPromptSubmit` - neither is ever the answer to a question.
+- **Fixed: `node cli.js verify`'s auto-generated ground-truth pairs could be wrong.** `extractQaFixtures` paired a question with "whichever Stop landed within the next 8 rows" - if the conversation moved to a new question before a Stop fired for the first one, that could pair a prompt with an answer that actually belongs to a *later* question, silently corrupting the benchmark's own ground truth. Now the paired Stop must land before the next `UserPromptSubmit`, not just within a fixed row count.
+- **Changed: test suite now pinned to `--test-concurrency=1`** (`npm test`). With two heavy local models (~1.2GB embedding + ~560MB reranker) each loaded fresh per spawned `server.js` process, Node's default parallel test-file execution could exceed available RAM on a modest VPS and get processes OOM-killed mid-test. Slower (~90s vs ~45s) but reliable.
+- **Combined effect, measured with `node cli.js verify` against this installation's real 400-row history: real-answer hit rate (top-5) went from 3% (1/30) at the start of this work to 33% (10/30).**
+
+## 0.6.0 — Russian retrieval: better embedding model + fixed a self-matching noise bug
+
+- **Changed: embedding model, MiniLM → EmbeddingGemma.** `Xenova/all-MiniLM-L6-v2` was English-centric and matched Russian conversational text poorly. Measured on a clean 10-pair isolated benchmark (same questions/answers, semantic-only ranking): MiniLM found the right answer 30% of the time (top-5) vs 70% for EmbeddingGemma (`onnx-community/embeddinggemma-300m-ONNX`) - `intfloat/multilingual-e5-small` scored 60% and was also considered. Costs ~1.2GB on disk/load vs MiniLM's ~90MB; only worth it on an installation with the RAM headroom. Stored embeddings are versioned now (`meta.embedding_model`) - switching `EMBEDDING_MODEL` again in the future auto-wipes old vectors so they don't get compared cross-model (which would silently produce garbage similarity scores, not an error).
+- **Fixed: `memory_recall`/`memory_recall_recent` could return raw captured questions instead of their answers.** The candidate pool included `key='UserPromptSubmit'` rows (the hook adapter's raw capture of what the user typed) alongside `key='Stop'` answer rows - a re-asked question's closest match by keyword/embedding was almost always *another stored question* worded similarly, not the actual answer, crowding it out of the top-K. `UserPromptSubmit` rows are now excluded from recall's candidate pool entirely (still stored, still visible via `node cli.js list`/`search`, just never surface as a recall *result*).
+- **Combined effect, measured with `node cli.js verify` against this installation's real 400-row history:** real-answer hit rate (top-5) went from 3% (1/30) to 13% (4/30).
+
 ## 0.5.0 — objective verify command, and what it found
 
 - **Added: `node cli.js verify`.** Auto-builds a ground-truth test set from real history (every captured `UserPromptSubmit` question paired with the `Stop` row that answered it) and re-asks each as a `memory_recall` query, checking whether the real past answer surfaces in the top-K. No hand-written fixtures, no LLM judge - pure precision@K against this installation's own actual usage.
