@@ -2,7 +2,7 @@
 
 MCP server for personal + shared memory that works with any MCP-compatible agent (Claude Code, Cursor, Codex CLI, ...). Personal entries are visible only to the agent that wrote them; shared entries are visible to every agent connected to the same project. Search is hybrid — SQLite FTS5 keyword matching fused with local, offline semantic search (see below) — ranked by past outcome (`success`/`failure`) and recall count.
 
-Nine MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `memory_stats`, `memory_recall_recent`, `memory_correct`, `memory_touch`, `memory_link`, `memory_convention`.
+Sixteen MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `memory_stats`, `memory_recall_recent`, `memory_correct`, `memory_touch`, `memory_link`, `memory_convention`, `memory_session_start`, `memory_session_end`, `memory_replay`, `memory_skill_save`, `memory_skill_match`, `memory_skill_score`, `memory_premortem`.
 
 ## Correcting, confirming, linking, conventions
 
@@ -10,6 +10,12 @@ Nine MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `memo
 - **`memory_touch`** confirms an entry is still true/relevant right now without changing its text - resets its recall-ranking freshness.
 - **`memory_link`** connects two entries with an optional relation label (e.g. `caused-by`, `supersedes`). Linked entries show up as indented `-> `/`<- ` lines under either entry whenever it's recalled.
 - **`memory_convention`** stores a project rule/standard (`type=convention`) instead of a one-off fact. Conventions always sort first in `memory_recall` and `memory_recall_recent`, regardless of recency or decay - they don't stop being true just because nobody hit them last week.
+
+## Session replay, skills, premortem
+
+- **`memory_session_start` / `memory_session_end` / `memory_replay`.** The Claude Code adapter calls `memory_session_start` on `SessionStart` and `memory_session_end` (with a summary of the last assistant message) on `Stop`, keyed by Claude Code's own `session_id`. `memory_replay` returns a recap of the most recently *finished* session - the in-progress one is naturally excluded since it has no end time yet. `context-inject.js` calls this automatically and prepends the recap to the session-start context, ahead of the usual recent-memories bullet list.
+- **`memory_skill_save` / `memory_skill_match` / `memory_skill_score`.** Skills are named, reusable task recipes (a "how to do X" procedure) stored separately from one-off facts, with a running success rate. Saving under an existing name updates that recipe instead of creating a near-duplicate. Matching ranks by success rate (`times_succeeded / times_used`) first.
+- **`memory_premortem`.** Given a short description of an action about to be taken, searches memory the same way `memory_recall` does but returns only the two kinds of rows that represent real risk: past `outcome=failure` entries and `type=convention` rules relevant to that action. General facts (successes, unknowns) are filtered out - this tool is specifically "what could bite me here," not "what do I know about this."
 
 ## Semantic recall
 

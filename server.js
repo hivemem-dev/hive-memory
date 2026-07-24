@@ -22,7 +22,7 @@ const PROJECT = process.env.HIVE_MEMORY_PROJECT || process.cwd();
 const LIGHTWEIGHT = process.env.HIVE_MEMORY_LIGHTWEIGHT === '1';
 
 const server = new Server(
-  { name: 'hive-memory', version: '0.3.0' },
+  { name: 'hive-memory', version: '0.4.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -127,6 +127,83 @@ const TOOLS = [
         scope: { type: 'string', enum: ['personal', 'shared', 'global'], default: 'shared' },
       },
       required: ['value'],
+    },
+  },
+  {
+    name: 'memory_session_start',
+    description: 'Mark the start of a new agent session (used by hook adapters; safe to call more than once for the same session_key).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_key: { type: 'string', description: 'Stable id for this session, e.g. the host agent\'s own session_id' },
+      },
+      required: ['session_key'],
+    },
+  },
+  {
+    name: 'memory_session_end',
+    description: 'Mark a session as finished, with an optional short summary of what happened. Powers memory_replay for the next session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_key: { type: 'string' },
+        summary: { type: 'string' },
+      },
+      required: ['session_key'],
+    },
+  },
+  {
+    name: 'memory_replay',
+    description: 'Recap the most recently finished session for this project/agent - what happened, so a new session can pick up where the last one left off.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'memory_skill_save',
+    description: 'Save or update a reusable task recipe (a named "how to do X" procedure), distinct from a one-off fact.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Short stable name to look this recipe up by, e.g. "deploy-staging"' },
+        body: { type: 'string', description: 'The steps/recipe text' },
+        scope: { type: 'string', enum: ['personal', 'shared', 'global'], default: 'shared' },
+      },
+      required: ['name', 'body'],
+    },
+  },
+  {
+    name: 'memory_skill_match',
+    description: 'Find saved recipes relevant to a task, ranked by past success rate.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        limit: { type: 'number', default: 5 },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'memory_skill_score',
+    description: 'Record whether using a saved skill/recipe (by id, from memory_skill_match output) worked out this time. Improves future ranking.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number' },
+        outcome: { type: 'string', enum: ['success', 'failure'] },
+      },
+      required: ['id', 'outcome'],
+    },
+  },
+  {
+    name: 'memory_premortem',
+    description: 'Before doing something risky, check memory for related past failures and conventions that could apply. Returns only failure/convention entries, not general facts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'Short description of the action about to be taken' },
+        limit: { type: 'number', default: 8 },
+      },
+      required: ['action'],
     },
   },
 ];
@@ -256,6 +333,68 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     const action = result.deduped ? 'Reinforced existing convention' : 'Stored new convention';
     return { content: [{ type: 'text', text: `${action} (id ${result.id}, scope ${args.scope || 'shared'})` }] };
+  }
+
+  if (name === 'memory_session_start') {
+    memory.startSession({ sessionKey: args.session_key, agent: AGENT, project: PROJECT });
+    return { content: [{ type: 'text', text: `Session ${args.session_key} started` }] };
+  }
+
+  if (name === 'memory_session_end') {
+    const summary = args.summary ? summarize(args.summary) : null;
+    memory.endSession({ sessionKey: args.session_key, summary });
+    return { content: [{ type: 'text', text: `Session ${args.session_key} ended` }] };
+  }
+
+  if (name === 'memory_replay') {
+    const session = memory.getLastEndedSession({ agent: AGENT, project: PROJECT });
+    if (!session) {
+      return { content: [{ type: 'text', text: 'No previous session recorded yet.' }] };
+    }
+    const started = new Date(session.started_at).toISOString();
+    const ended = new Date(session.ended_at).toISOString();
+    const text = `Previous session (${started} -> ${ended}):\n${session.summary || '(no summary recorded)'}`;
+    return { content: [{ type: 'text', text }] };
+  }
+
+  if (name === 'memory_skill_save') {
+    const result = memory.skillSave({
+      scope: args.scope || 'shared',
+      agent: AGENT,
+      project: PROJECT,
+      name: args.name,
+      body: args.body,
+    });
+    const action = result.updated ? 'Updated existing skill' : 'Saved new skill';
+    return { content: [{ type: 'text', text: `${action} "${args.name}" (id ${result.id})` }] };
+  }
+
+  if (name === 'memory_skill_match') {
+    const rows = memory.skillMatch({ query: args.query, project: PROJECT, agent: AGENT, limit: args.limit || 5 });
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: 'No matching skills found.' }] };
+    }
+    const text = rows
+      .map(r => `#${r.id} [${r.scope}/${r.agent}] ${r.name} (${r.times_succeeded}/${r.times_used} succeeded)\n    ${r.body}`)
+      .join('\n');
+    return { content: [{ type: 'text', text }] };
+  }
+
+  if (name === 'memory_skill_score') {
+    const result = memory.skillScore({ id: args.id, outcome: args.outcome });
+    if (!result.ok) {
+      return { content: [{ type: 'text', text: `No skill with id ${args.id}` }], isError: true };
+    }
+    return { content: [{ type: 'text', text: `Scored skill #${args.id} as ${args.outcome}` }] };
+  }
+
+  if (name === 'memory_premortem') {
+    const rows = await memory.premortem({ query: args.action, project: PROJECT, agent: AGENT, limit: args.limit || 8 });
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: 'No known risks or conventions found for this - no history to flag.' }] };
+    }
+    const text = `Before doing this, hive-memory flags:\n${rows.map(formatRow).join('\n')}`;
+    return { content: [{ type: 'text', text }] };
   }
 
   throw new Error(`Unknown tool: ${name}`);

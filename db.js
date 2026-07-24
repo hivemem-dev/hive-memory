@@ -58,6 +58,43 @@ CREATE TABLE IF NOT EXISTS memory_links (
   UNIQUE(from_id, to_id, relation)
 );
 
+-- One row per agent session (as identified by the host agent's own
+-- session_id, e.g. Claude Code's hook payload). started_at is set when the
+-- session starts; ended_at/summary are filled in when it ends. A row with
+-- ended_at IS NULL is still in progress, which is exactly why
+-- getLastEndedSession() (ORDER BY ended_at DESC) naturally skips the current
+-- session without needing to explicitly exclude it.
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_key TEXT NOT NULL UNIQUE,
+  agent TEXT NOT NULL,
+  project TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  summary TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_agent_project ON sessions(agent, project, ended_at);
+
+-- Reusable task recipes, distinct from memory facts: a skill has a name
+-- you look it up by and a running success rate, not just a value and an
+-- outcome enum. UNIQUE(agent, project, scope, name) so memory_skill_save
+-- upserts (refines an existing recipe) instead of piling up near-duplicates
+-- under slightly different names.
+CREATE TABLE IF NOT EXISTS skills (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL CHECK(scope IN ('personal', 'shared', 'global')),
+  agent TEXT NOT NULL,
+  project TEXT NOT NULL,
+  name TEXT NOT NULL,
+  body TEXT NOT NULL,
+  times_used INTEGER DEFAULT 0,
+  times_succeeded INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(agent, project, scope, name)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   value, key, content='memory', content_rowid='id'
 );
@@ -409,6 +446,101 @@ function getLinks(id) {
   `).all(id, id, id, id);
 }
 
+// --- Sessions (for memory_replay - recap of the previous session) ---
+
+// Idempotent: a session's SessionStart hook may fire more than once for the
+// same session_key in edge cases (retries, multiple hook matchers) - INSERT
+// OR IGNORE keeps the original started_at rather than resetting it.
+function startSession({ sessionKey, agent, project }) {
+  db.prepare(`
+    INSERT OR IGNORE INTO sessions (session_key, agent, project, started_at)
+    VALUES (?, ?, ?, ?)
+  `).run(sessionKey, agent, project, Date.now());
+  return { ok: true };
+}
+
+function endSession({ sessionKey, summary }) {
+  const info = db.prepare('UPDATE sessions SET ended_at = ?, summary = ? WHERE session_key = ?')
+    .run(Date.now(), summary || null, sessionKey);
+  return { ok: info.changes > 0 };
+}
+
+// The current (in-progress) session has ended_at IS NULL, so it's
+// automatically excluded here without needing to know its own session_key -
+// this always returns the most recently *finished* session.
+function getLastEndedSession({ agent, project }) {
+  return db.prepare(`
+    SELECT session_key, started_at, ended_at, summary
+    FROM sessions
+    WHERE agent = ? AND project = ? AND ended_at IS NOT NULL
+    ORDER BY ended_at DESC
+    LIMIT 1
+  `).get(agent, project);
+}
+
+// --- Skills (reusable task recipes - see skills table comment) ---
+
+// Upserts by (agent, project, scope, name): a second save under the same
+// name refines the existing recipe (new body, bumped updated_at) instead of
+// piling up near-duplicates.
+function skillSave({ scope, agent, project, name, body }) {
+  const now = Date.now();
+  const existing = db.prepare('SELECT id FROM skills WHERE agent = ? AND project = ? AND scope = ? AND name = ?')
+    .get(agent, project, scope, name);
+  if (existing) {
+    db.prepare('UPDATE skills SET body = ?, updated_at = ? WHERE id = ?').run(body, now, existing.id);
+    return { id: existing.id, updated: true };
+  }
+  const info = db.prepare(`
+    INSERT INTO skills (scope, agent, project, name, body, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(scope, agent, project, name, body, now, now);
+  return { id: info.lastInsertRowid, updated: false };
+}
+
+// Same personal/shared/global visibility rule as memory (see
+// visibilityClause) - plain LIKE match, not FTS: skill sets are small
+// (dozens, not thousands of rows) so an index-free scan is plenty fast and
+// avoids standing up a second FTS5 table just for this.
+function skillMatch({ query, project, agent, limit = 5, admin = false }) {
+  const visibility = visibilityClause({ scope: undefined, project, agent, admin });
+  // Every word must appear somewhere (name OR body) - matching on the whole
+  // query as one substring would miss "deploy staging" against a skill
+  // named "deploy-staging" just because the words aren't adjacent with
+  // exactly that spacing/punctuation.
+  const words = query.trim().split(/\s+/).filter(Boolean).map(w => `%${w.toLowerCase()}%`);
+  const wordClauses = words.map(() => '(LOWER(name) LIKE ? OR LOWER(body) LIKE ?)').join(' AND ');
+  const wordParams = words.flatMap(w => [w, w]);
+  const sql = `
+    SELECT id, scope, agent, name, body, times_used, times_succeeded, updated_at
+    FROM skills m
+    WHERE (${visibility.sql}) AND (${wordClauses})
+    ORDER BY (CAST(times_succeeded AS REAL) / (times_used + 1)) DESC, times_used DESC
+    LIMIT ?
+  `;
+  return db.prepare(sql).all(...visibility.params, ...wordParams, limit);
+}
+
+function skillScore({ id, outcome }) {
+  const sql = outcome === 'success'
+    ? 'UPDATE skills SET times_used = times_used + 1, times_succeeded = times_succeeded + 1, updated_at = ? WHERE id = ?'
+    : 'UPDATE skills SET times_used = times_used + 1, updated_at = ? WHERE id = ?';
+  const info = db.prepare(sql).run(Date.now(), id);
+  return { ok: info.changes > 0 };
+}
+
+// --- Premortem ("what could go wrong before I do this") ---
+
+// Runs the normal hybrid search, then narrows it to just the two kinds of
+// rows that actually represent risk: outcome='failure' (a lesson from a past
+// mistake) and type='convention' (a rule that could be violated). A relevant
+// outcome='success' or outcome='unknown' fact isn't a risk signal, so it's
+// filtered out here even though the search matched it.
+async function premortem({ query, project, scope, agent, limit = 8, admin = false }) {
+  const pool = await recallHybrid({ query, project, scope, agent, limit: Math.max(limit * 4, 30), admin });
+  return pool.filter(r => r.outcome === 'failure' || r.type === 'convention').slice(0, limit);
+}
+
 function stats({ project }) {
   const total = db.prepare('SELECT COUNT(*) as n FROM memory WHERE project = ?').get(project);
   const byScope = db.prepare('SELECT scope, COUNT(*) as n FROM memory WHERE project = ? GROUP BY scope').all(project);
@@ -455,6 +587,13 @@ module.exports = {
   touchMemory,
   addLink,
   getLinks,
+  startSession,
+  endSession,
+  getLastEndedSession,
+  skillSave,
+  skillMatch,
+  skillScore,
+  premortem,
   stats,
   listAll,
   DB_PATH,

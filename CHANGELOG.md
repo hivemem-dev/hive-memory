@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 — session replay, skills, premortem
+
+- **Added: `memory_session_start` / `memory_session_end` / `memory_replay`.** A `sessions` table tracks agent sessions keyed by the host agent's own `session_id`. The Claude Code adapter starts a session on `SessionStart` and ends it on `Stop` (with the last assistant message as the summary); `context-inject.js` now calls `memory_replay` at the start of every new session and prepends the previous session's recap to the injected context, ahead of the usual recent-memories list.
+- **Added: `memory_skill_save` / `memory_skill_match` / `memory_skill_score`.** A `skills` table stores named, reusable task recipes distinct from one-off facts, with a running success rate. Saving under an existing name upserts instead of duplicating; matching ranks by success rate.
+- **Added: `memory_premortem`.** Runs the same hybrid search as `memory_recall` but returns only `outcome=failure` and `type=convention` rows relevant to a described action - a filtered "what could go wrong here" check instead of a general lookup.
+- **Fixed (dev-time only, caught before release): a stray backtick inside a SQL comment inside the schema-setup template literal in `db.js` silently broke the whole module (`SyntaxError: missing ) after argument list`), which made every MCP call hang until its caller's timeout. Removed the backtick from the comment.
+- **Fixed: `memory_skill_match` required the entire query to appear as one substring**, so a two-word query like "deploy staging" wouldn't match a skill named "deploy-staging" even though both words were present. Now matches per-word (every word must appear somewhere in name or body), same tokenization philosophy as the FTS5 keyword search.
+
 ## 0.3.0 — correct/touch/link/convention
 
 - **Added: `memory_correct`.** Fixes an existing entry's text in place (by id) instead of leaving stale/wrong facts around and remembering a corrected duplicate next to them. Clears the entry's embedding so the next recall re-embeds the corrected text.

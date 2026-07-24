@@ -98,4 +98,16 @@ function recallRecentViaMcp({ agent, project, limit }) {
   return callMcpTool({ agent, project }, 'memory_recall_recent', { limit });
 }
 
-module.exports = { rememberViaMcp, recallRecentViaMcp };
+function sessionStartViaMcp({ agent, project, sessionKey }) {
+  return callMcpTool({ agent, project }, 'memory_session_start', { session_key: sessionKey });
+}
+
+function sessionEndViaMcp({ agent, project, sessionKey, summary }) {
+  return callMcpTool({ agent, project }, 'memory_session_end', { session_key: sessionKey, summary });
+}
+
+function replayViaMcp({ agent, project }) {
+  return callMcpTool({ agent, project }, 'memory_replay', {});
+}
+
+module.exports = { rememberViaMcp, recallRecentViaMcp, sessionStartViaMcp, sessionEndViaMcp, replayViaMcp };

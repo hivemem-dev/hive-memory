@@ -8,7 +8,10 @@
 // true} instead of crashing the hook.
 'use strict';
 
-const { recallRecentViaMcp } = require('../lib/remember');
+const { recallRecentViaMcp, replayViaMcp } = require('../lib/remember');
+
+const NO_PREVIOUS_SESSION_TEXT = 'No previous session recorded yet.';
+const MAX_REPLAY_CHARS = 600;
 
 const NO_MEMORIES_TEXT = 'No memories yet for this project.';
 
@@ -31,11 +34,29 @@ process.stdin.on('end', async () => {
   const project = process.env.HIVE_MEMORY_PROJECT || event.cwd;
 
   try {
+    let replaySection = '';
+    try {
+      const replayResult = await replayViaMcp({ agent: 'claude-code', project });
+      const replayText = replayResult?.content?.[0]?.text || '';
+      if (replayText && replayText !== NO_PREVIOUS_SESSION_TEXT) {
+        const trimmed = replayText.length > MAX_REPLAY_CHARS ? `${replayText.slice(0, MAX_REPLAY_CHARS)}…` : replayText;
+        replaySection = `## Previous session\n\n${trimmed}\n\n`;
+      }
+    } catch (err) {
+      console.error('hive-memory replay failed:', err.message);
+    }
+
     const result = await recallRecentViaMcp({ agent: 'claude-code', project, limit: 20 });
     const text = result?.content?.[0]?.text || '';
 
     if (!text || text === NO_MEMORIES_TEXT) {
-      process.stdout.write(JSON.stringify({ continue: true }));
+      if (replaySection) {
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: replaySection.trim() },
+        }));
+      } else {
+        process.stdout.write(JSON.stringify({ continue: true }));
+      }
       return;
     }
 
@@ -60,7 +81,7 @@ process.stdin.on('end', async () => {
 
     const bullets = bulletList.join('\n');
 
-    let additionalContext = `## Previous context from hive-memory\n\n${bullets}`;
+    let additionalContext = `${replaySection}## Previous context from hive-memory\n\n${bullets}`;
     if (omitted > 0) {
       additionalContext += `\n\n_(${omitted} more entries omitted — budget limit)_`;
     }

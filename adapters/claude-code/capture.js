@@ -5,8 +5,18 @@
 'use strict';
 
 const fs = require('fs');
-const { rememberViaMcp } = require('../lib/remember');
+const { rememberViaMcp, sessionStartViaMcp, sessionEndViaMcp } = require('../lib/remember');
 const { isSignificant } = require('../lib/significance');
+
+// Claude Code's own session_id, stable for the whole session and present on
+// every hook event - this is what ties a SessionStart row to the Stop event
+// that ends it, without this stateless per-event process needing to persist
+// anything itself. Falls back to a fixed per-project key if it's ever
+// missing so session_start/session_end still run instead of throwing, at
+// the cost of collapsing to a single reused row.
+function sessionKeyFor(event, project) {
+  return event.session_id || `${project}:no-session-id`;
+}
 
 // Tool names whose actual arguments are worth capturing verbatim - without
 // this, every PostToolUse row collapsed into the bare tool name ("PostToolUse:
@@ -84,24 +94,46 @@ process.stdin.on('end', async () => {
 
   const name = event.hook_event_name || process.argv[2] || 'event';
   const summary = buildSummary(name, event);
+  // A stable project identity must come from config, not from event.cwd -
+  // the hook's cwd drifts with every `cd`/subprocess a session runs, which
+  // used to fragment one workspace's memory across dozens of one-off
+  // "projects" (e.g. a temp upload folder visited once). HIVE_MEMORY_PROJECT
+  // is set explicitly in hooks.json precisely so this stays fixed.
+  const project = process.env.HIVE_MEMORY_PROJECT || event.cwd;
 
   if (isSignificant(name, event)) {
     try {
       await rememberViaMcp({
         agent: 'claude-code',
-        // A stable project identity must come from config, not from
-        // event.cwd - the hook's cwd drifts with every `cd`/subprocess a
-        // session runs, which used to fragment one workspace's memory
-        // across dozens of one-off "projects" (e.g. a temp upload folder
-        // visited once). HIVE_MEMORY_PROJECT is set explicitly in
-        // hooks.json precisely so this stays fixed.
-        project: process.env.HIVE_MEMORY_PROJECT || event.cwd,
+        project,
         value: summary,
         key: name,
         scope: 'personal',
       });
     } catch (err) {
       console.error('hive-memory capture failed:', err.message);
+    }
+  }
+
+  if (name === 'SessionStart') {
+    try {
+      await sessionStartViaMcp({ agent: 'claude-code', project, sessionKey: sessionKeyFor(event, project) });
+    } catch (err) {
+      console.error('hive-memory session_start failed:', err.message);
+    }
+  }
+
+  if (name === 'Stop') {
+    try {
+      const lastText = event.transcript_path ? readLastAssistantText(event.transcript_path) : '';
+      await sessionEndViaMcp({
+        agent: 'claude-code',
+        project,
+        sessionKey: sessionKeyFor(event, project),
+        summary: lastText || null,
+      });
+    } catch (err) {
+      console.error('hive-memory session_end failed:', err.message);
     }
   }
 
