@@ -475,7 +475,11 @@ async function rerank(query, rows) {
 // pool is then reranked (see rerank() above) before being cut down to
 // `limit` - fusion picks a rough top pool fast, the reranker picks the best
 // few out of that pool carefully.
-async function recallHybrid({ query, project, scope, agent, limit = 10, admin = false }) {
+// skipRerank is a diagnostic escape hatch (used by cli.js verify --stage),
+// not something normal callers should pass - it answers "did the fast rough
+// sort even pick this up" separately from "did the careful second pass rank
+// it highly", without paying the reranker's per-candidate cost.
+async function recallHybrid({ query, project, scope, agent, limit = 10, admin = false, skipRerank = false }) {
   const poolSize = Math.max(limit * 4, 20);
   const ftsRows = ftsCandidates({ query, project, scope, agent, limit: poolSize, admin });
 
@@ -499,7 +503,7 @@ async function recallHybrid({ query, project, scope, agent, limit = 10, admin = 
   });
 
   const pool = [...fused.values()].sort((a, b) => b.score - a.score).slice(0, poolSize).map(m => m.row);
-  const reranked = await rerank(query, pool);
+  const reranked = skipRerank ? pool : await rerank(query, pool);
   const rows = reranked.slice(0, limit);
   touchRows(rows.map(r => r.id));
   return rows;
