@@ -168,6 +168,42 @@ function cmdSearch(query, flags) {
   }
 }
 
+// Objective with-vs-without check: auto-builds a ground-truth set from real
+// past UserPromptSubmit->Stop pairs (see db.extractQaFixtures) and re-asks
+// each question as a memory_recall query. "with real recall" = does the
+// query-aware hybrid search find the actual past answer again. "with a bare
+// recent-N log" = the closest thing to not having real retrieval, just a
+// chronological dump - the gap between the two is what the search is
+// actually worth, not just "memory beats no memory" (trivially true).
+async function cmdVerify(flags) {
+  const db = require('./db');
+  const project = flags.project || process.cwd();
+  const agent = flags.agent || 'claude-code';
+  const sampleSize = flags.sample ? parseInt(flags.sample, 10) : 20;
+  const k = flags.k ? parseInt(flags.k, 10) : 5;
+
+  const report = await db.verifyRetrieval({ project, agent, sampleSize, k });
+
+  if (report.sampleSize === 0) {
+    console.log(`No UserPromptSubmit->Stop pairs found for project ${project}, agent ${agent} - nothing to verify yet.`);
+    return;
+  }
+
+  console.log(`Verifying retrieval for project ${project}, agent ${agent} (${report.sampleSize} real past Q->A pairs, top-${k}):\n`);
+  console.log(`  hive-memory recall as shipped (query-aware search): ${report.hybridRecall.hits}/${report.sampleSize} found the real past answer again (${(report.hybridRecall.rate * 100).toFixed(0)}%), MRR ${report.hybridRecall.mrr.toFixed(2)}`);
+  console.log(`  same search, ignoring other questions as noise (answers only): ${report.answersOnlyRecall.hits}/${report.sampleSize} (${(report.answersOnlyRecall.rate * 100).toFixed(0)}%)`);
+  console.log(`  bare recent-N log (no search, chronological): ${report.recentOnlyRecall.hits}/${report.sampleSize} (${(report.recentOnlyRecall.rate * 100).toFixed(0)}%)`);
+  console.log(`  without any memory at all: 0/${report.sampleSize} (0%) - nothing to recall from\n`);
+
+  const misses = report.results.filter(r => !r.hybridHit);
+  if (misses.length > 0) {
+    console.log(`Missed (${misses.length}):`);
+    for (const m of misses) {
+      console.log(`  Q: ${truncate(m.question, 80)}\n  A: ${truncate(m.answerSnippet, 80)}\n`);
+    }
+  }
+}
+
 function main() {
   const [, , cmd, ...rest] = process.argv;
 
@@ -181,13 +217,20 @@ function main() {
   } else if (cmd === 'search') {
     const { positional, flags } = parseArgs(rest);
     cmdSearch(positional[0], flags);
+  } else if (cmd === 'verify') {
+    const { flags } = parseArgs(rest);
+    cmdVerify(flags).catch(err => {
+      console.error('verify failed:', err.message);
+      process.exitCode = 1;
+    });
   } else {
     console.log(
       'Usage:\n' +
       '  node cli.js status\n' +
       '  node cli.js attach <claude-code|cursor|codex|all>\n' +
       '  node cli.js list [--project X] [--scope personal|shared|global] [--agent X] [--limit N]\n' +
-      '  node cli.js search <query> [--project X] [--limit N]'
+      '  node cli.js search <query> [--project X] [--limit N]\n' +
+      '  node cli.js verify [--project X] [--agent X] [--sample N] [--k N]'
     );
     if (cmd) process.exitCode = 1;
   }

@@ -541,6 +541,87 @@ async function premortem({ query, project, scope, agent, limit = 8, admin = fals
   return pool.filter(r => r.outcome === 'failure' || r.type === 'convention').slice(0, limit);
 }
 
+// --- Verify: does recall actually find things again? (node cli.js verify) ---
+
+// Auto-generates a ground-truth test set from real history instead of hand-
+// written fixtures: every captured UserPromptSubmit row that's a real
+// question (long enough to be substantive) is paired with whichever Stop
+// row landed right after it (same agent/project, next few ids - PostToolUse
+// rows are usually interspersed between them). This gives "if I ask this
+// again, does recall find the answer I got last time" pairs for free, drawn
+// from what this exact installation has actually been asked.
+function extractQaFixtures({ project, agent, sampleSize = 20 }) {
+  const prompts = db.prepare(`
+    SELECT id, value FROM memory
+    WHERE project = ? AND agent = ? AND key = 'UserPromptSubmit' AND LENGTH(value) > 30
+    ORDER BY id DESC
+  `).all(project, agent);
+
+  const fixtures = [];
+  for (const p of prompts) {
+    if (fixtures.length >= sampleSize) break;
+    const answer = db.prepare(`
+      SELECT id, value FROM memory
+      WHERE project = ? AND agent = ? AND key = 'Stop' AND id > ? AND id <= ?
+      ORDER BY id ASC LIMIT 1
+    `).get(project, agent, p.id, p.id + 8);
+    if (!answer) continue;
+    fixtures.push({
+      questionId: p.id,
+      question: p.value.replace(/^UserPromptSubmit:\s*/, ''),
+      answerId: answer.id,
+      answerSnippet: answer.value.replace(/^Stop:\s*/, '').slice(0, 120),
+    });
+  }
+  return fixtures;
+}
+
+// For each fixture, re-asks the question text as a memory_recall query and
+// checks whether the matching answer row comes back in the top K - both via
+// the real hybrid search (query-aware) and via plain recallRecent
+// (chronological dump, no query awareness - the closest thing to "no real
+// retrieval, just skim what's recent"). The gap between the two numbers is
+// what query-aware recall is actually buying over a bare recent-N log.
+async function verifyRetrieval({ project, agent, sampleSize = 20, k = 5 }) {
+  const fixtures = extractQaFixtures({ project, agent, sampleSize });
+  const results = [];
+  for (const f of fixtures) {
+    // Pull a wider pool than k so answersOnlyHit (below) can re-rank within
+    // it - the raw top-k is dominated by other UserPromptSubmit rows that
+    // are textually similar to the query (a re-asked question looks most
+    // like other questions, not like its own answer), so scoring only the
+    // literal top-k would hide how much of the miss is "wrong kind of row"
+    // versus "answer just isn't findable at all".
+    const pool = await recallHybrid({ query: f.question, project, agent, limit: Math.max(k * 6, 30), admin: false, scope: undefined });
+    const hybridRows = pool.slice(0, k);
+    const hybridHit = hybridRows.some(r => r.id === f.answerId);
+    const hybridRank = hybridRows.findIndex(r => r.id === f.answerId);
+
+    const answersOnly = pool.filter(r => r.key === 'Stop').slice(0, k);
+    const answersOnlyHit = answersOnly.some(r => r.id === f.answerId);
+
+    const recentRows = recallRecent({ project, agent, limit: k });
+    const recentHit = recentRows.some(r => r.id === f.answerId);
+
+    results.push({ ...f, hybridHit, hybridRank: hybridHit ? hybridRank + 1 : null, answersOnlyHit, recentHit });
+  }
+
+  const n = results.length;
+  const hybridHits = results.filter(r => r.hybridHit).length;
+  const answersOnlyHits = results.filter(r => r.answersOnlyHit).length;
+  const recentHits = results.filter(r => r.recentHit).length;
+  const mrr = n === 0 ? 0 : results.reduce((sum, r) => sum + (r.hybridHit ? 1 / r.hybridRank : 0), 0) / n;
+
+  return {
+    k,
+    sampleSize: n,
+    hybridRecall: { hits: hybridHits, rate: n === 0 ? 0 : hybridHits / n, mrr },
+    answersOnlyRecall: { hits: answersOnlyHits, rate: n === 0 ? 0 : answersOnlyHits / n },
+    recentOnlyRecall: { hits: recentHits, rate: n === 0 ? 0 : recentHits / n },
+    results,
+  };
+}
+
 function stats({ project }) {
   const total = db.prepare('SELECT COUNT(*) as n FROM memory WHERE project = ?').get(project);
   const byScope = db.prepare('SELECT scope, COUNT(*) as n FROM memory WHERE project = ? GROUP BY scope').all(project);
@@ -594,6 +675,8 @@ module.exports = {
   skillMatch,
   skillScore,
   premortem,
+  extractQaFixtures,
+  verifyRetrieval,
   stats,
   listAll,
   DB_PATH,

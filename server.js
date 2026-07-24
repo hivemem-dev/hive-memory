@@ -22,7 +22,7 @@ const PROJECT = process.env.HIVE_MEMORY_PROJECT || process.cwd();
 const LIGHTWEIGHT = process.env.HIVE_MEMORY_LIGHTWEIGHT === '1';
 
 const server = new Server(
-  { name: 'hive-memory', version: '0.4.0' },
+  { name: 'hive-memory', version: '0.5.0' },
   { capabilities: { tools: {} } }
 );
 

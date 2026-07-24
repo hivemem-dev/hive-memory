@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0 — objective verify command, and what it found
+
+- **Added: `node cli.js verify`.** Auto-builds a ground-truth test set from real history (every captured `UserPromptSubmit` question paired with the `Stop` row that answered it) and re-asks each as a `memory_recall` query, checking whether the real past answer surfaces in the top-K. No hand-written fixtures, no LLM judge - pure precision@K against this installation's own actual usage.
+- **Finding (not yet fixed): retrieval hit rate on real captured chat history is low - 3% as shipped (1/30, top-5) on this installation's data**, versus 0% for a bare chronological dump and 0% for no memory at all. Root cause: `memory_recall`'s search pool mixes raw `UserPromptSubmit` rows in with `Stop` answer rows, and a re-asked question's top matches are almost always *other stored questions* worded similarly, not the answer - filtering the results down to `Stop` rows only raises the hit rate to 13% (4/30), which is the real ceiling of the current keyword+embedding search on short, casual, typo-heavy prompts against long generated answers. Recorded here rather than silently patched - the fix (e.g. excluding raw prompt rows from recall's candidate pool, or scoring key='Stop' higher) needs a decision on whether hook-captured chat log rows should be searchable answer candidates at all.
+
 ## 0.4.0 — session replay, skills, premortem
 
 - **Added: `memory_session_start` / `memory_session_end` / `memory_replay`.** A `sessions` table tracks agent sessions keyed by the host agent's own `session_id`. The Claude Code adapter starts a session on `SessionStart` and ends it on `Stop` (with the last assistant message as the summary); `context-inject.js` now calls `memory_replay` at the start of every new session and prepends the previous session's recap to the injected context, ahead of the usual recent-memories list.

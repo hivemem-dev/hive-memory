@@ -85,6 +85,14 @@ See `.env.example`: `HIVE_MEMORY_AGENT`, `HIVE_MEMORY_PROJECT`, `HIVE_MEMORY_DB`
 
 **Set `HIVE_MEMORY_PROJECT` explicitly if you want one stable memory scope.** If unset, the Claude Code/Cursor hook adapters fall back to the hook event's current working directory - fine if each of your projects is its own repo/cwd, but if a session ever `cd`s elsewhere (a subprocess, a temp folder, a nested app dir), that becomes a brand-new, disconnected memory bucket. Pin `HIVE_MEMORY_PROJECT` in your hook commands and in your MCP server's `env` (must match) to keep everything under one project regardless of cwd drift.
 
+## Objective verify (with hive-memory vs without)
+
+```bash
+node cli.js verify [--project X] [--agent X] [--sample N] [--k N]
+```
+
+Builds a ground-truth test set automatically from real history - every captured `UserPromptSubmit` that's a real question, paired with whichever `Stop` row answered it - then re-asks each question as a `memory_recall` query and checks whether the real past answer comes back in the top-K. Reports three numbers: the raw hybrid-search hit rate as shipped, the same search with other stored questions filtered out as noise (an upper bound - the fix isn't built yet), and a bare chronological recent-N dump (the closest thing to "no real retrieval"). No memory at all is 0% by construction.
+
 ## Tests
 
 ```bash
