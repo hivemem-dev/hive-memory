@@ -1,6 +1,6 @@
 {
   "name": "hive-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Universal MCP memory server: personal + shared memory across any MCP-compatible agent",
   "main": "server.js",
   "bin": {

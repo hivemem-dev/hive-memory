@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 — correct/touch/link/convention
+
+- **Added: `memory_correct`.** Fixes an existing entry's text in place (by id) instead of leaving stale/wrong facts around and remembering a corrected duplicate next to them. Clears the entry's embedding so the next recall re-embeds the corrected text.
+- **Added: `memory_touch`.** Explicitly confirms an entry is still true/relevant, bumping `times_recalled` and resetting `updated_at` (unlike the implicit bump a recall hit does, which doesn't reset freshness).
+- **Added: `memory_link`.** Links two entries by id with an optional relation label. Recall output now shows linked entries as indented `-> `/`<- ` lines under either side. Idempotent per (from, to, relation) triple.
+- **Added: `memory_convention`.** Stores project rules/standards as a distinct `type='convention'` row. Conventions always sort first in `memory_recall`/`memory_recall_recent`, ahead of outcome and decay ranking.
+- **Fixed: FTS5 query parsing on words with special characters.** `memory_recall`/`memory_recall_recent` search terms like "force-push" or anything containing `-`/`:` were being parsed as FTS5 query operators (e.g. NOT / column-filter) instead of literal words, so the search silently failed with "no such column" or missed results. Each word is now wrapped in a quoted FTS5 prefix query (`"word"*`) so special characters can't be misread as syntax.
+
 ## 0.2.0 — recall was silently broken; root-caused and fixed, plus semantic search
 
 Found while investigating why `memory_recall` always returned "No matching memories found" despite `memory_remember` clearly writing rows:

@@ -43,6 +43,21 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE INDEX IF NOT EXISTS idx_scope_project ON memory(scope, project);
 CREATE INDEX IF NOT EXISTS idx_agent ON memory(agent);
 
+-- Links between two memory rows (e.g. "this fact caused that failure"),
+-- undirected in practice but stored as from/to since a relation label can
+-- read one-directionally ("supersedes", "caused-by"). relation defaults to
+-- '' rather than NULL so the UNIQUE constraint actually dedupes repeat
+-- links - SQLite treats every NULL as distinct, so a NULL relation column
+-- would let the same pair be linked over and over.
+CREATE TABLE IF NOT EXISTS memory_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_id INTEGER NOT NULL REFERENCES memory(id),
+  to_id INTEGER NOT NULL REFERENCES memory(id),
+  relation TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(from_id, to_id, relation)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   value, key, content='memory', content_rowid='id'
 );
@@ -67,21 +82,33 @@ const memoryCols = db.prepare('PRAGMA table_info(memory)').all().map(c => c.name
 if (!memoryCols.includes('embedding')) {
   db.exec('ALTER TABLE memory ADD COLUMN embedding BLOB');
 }
+// type='convention' marks project rules/standards rather than one-off facts
+// or events - they don't decay the same way (a convention is still true
+// whether or not anyone recalled it last week), so recall/recallRecent sort
+// them first regardless of decay_score. CHECK can't be added via ALTER TABLE
+// on existing SQLite versions, so it's enforced in JS (see remember()) only
+// for rows written after this migration; that's fine, the column defaults
+// every pre-existing row to 'fact' either way.
+if (!memoryCols.includes('type')) {
+  db.exec("ALTER TABLE memory ADD COLUMN type TEXT NOT NULL DEFAULT 'fact'");
+}
 
 function normalize(text) {
   return text.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
-function remember({ scope, agent, project, key, value }) {
+function remember({ scope, agent, project, key, value, type = 'fact' }) {
   const now = Date.now();
   const normValue = normalize(value);
 
   // global entries aren't tied to a project: dedup by agent + text only, so
   // the same fact remembered from different projects reinforces one row
   // instead of creating a duplicate per project. personal/shared stay
-  // project-scoped exactly as before.
-  let candSql = 'SELECT id, value FROM memory WHERE scope = ?';
-  const candParams = [scope];
+  // project-scoped exactly as before. type is part of the dedup key too -
+  // the same sentence stored once as a fact and once as a convention should
+  // stay two distinct rows, not merge into whichever was written first.
+  let candSql = 'SELECT id, value FROM memory WHERE scope = ? AND type = ?';
+  const candParams = [scope, type];
   if (scope === 'global') {
     candSql += ' AND agent = ?';
     candParams.push(agent);
@@ -103,10 +130,10 @@ function remember({ scope, agent, project, key, value }) {
   }
 
   const stmt = db.prepare(`
-    INSERT INTO memory (scope, agent, project, key, value, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO memory (scope, agent, project, key, value, type, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const info = stmt.run(scope, agent, project, key || null, value, now, now);
+  const info = stmt.run(scope, agent, project, key || null, value, type, now, now);
   return { id: info.lastInsertRowid, deduped: false };
 }
 
@@ -155,18 +182,25 @@ function touchRows(ids) {
 // several (one word not appearing verbatim kills the whole search). Try the
 // strict AND match first (most precise); if that finds nothing, retry with
 // OR so a partial word-overlap still surfaces something instead of zero.
+// Each word is wrapped in a quoted FTS5 prefix-query ("word"*) rather than a
+// bare word*. Bare words let FTS5's query-syntax parser interpret characters
+// like "-" or ":" as operators (e.g. "force-push*" parses as a NOT/column
+// filter, not the literal word) - quoting forces it to be treated as a
+// single string literal instead. Internal double quotes are escaped by
+// doubling them, the standard FTS5 quoting rule.
 function buildFtsQueries(query) {
-  const words = query.trim().split(/\s+/).filter(Boolean).map(w => `${w.toLowerCase()}*`);
+  const words = query.trim().split(/\s+/).filter(Boolean)
+    .map(w => `"${w.toLowerCase().replace(/"/g, '""')}"*`);
   return { and: words.join(' '), or: words.join(' OR ') };
 }
 
 function runFtsQuery(matchQuery, visibility, limit) {
   const sql = `
-    SELECT m.id, m.scope, m.agent, m.key, m.value, m.outcome, m.times_recalled, m.created_at
+    SELECT m.id, m.scope, m.agent, m.key, m.value, m.type, m.outcome, m.times_recalled, m.created_at
     FROM memory_fts f
     JOIN memory m ON m.id = f.rowid
     WHERE memory_fts MATCH ? AND (${visibility.sql})
-    ORDER BY m.outcome = 'success' DESC, decay_score(m.times_recalled, m.updated_at) DESC, rank
+    ORDER BY m.type = 'convention' DESC, m.outcome = 'success' DESC, decay_score(m.times_recalled, m.updated_at) DESC, rank
     LIMIT ?
   `;
   return db.prepare(sql).all(matchQuery, ...visibility.params, limit);
@@ -196,11 +230,11 @@ function recall({ query, project, scope, agent, limit = 10, admin = false }) {
 // a real "recall" of a specific fact.
 function recallRecent({ project, agent, limit = 20 }) {
   const sql = `
-    SELECT id, scope, agent, key, value, outcome, times_recalled, created_at
+    SELECT id, scope, agent, key, value, type, outcome, times_recalled, created_at
     FROM memory
     WHERE (project = ? AND (scope = 'shared' OR (scope = 'personal' AND agent = ?)))
        OR (scope = 'global' AND agent = ?)
-    ORDER BY outcome = 'success' DESC, decay_score(times_recalled, updated_at) DESC
+    ORDER BY type = 'convention' DESC, outcome = 'success' DESC, decay_score(times_recalled, updated_at) DESC
     LIMIT ?
   `;
   return db.prepare(sql).all(project, agent, agent, limit);
@@ -280,7 +314,7 @@ async function backfillEmbeddings({ batchLimit = 200 } = {}) {
 function semanticCandidates({ queryVec, project, scope, agent, limit = 10, admin = false }) {
   const visibility = visibilityClause({ scope, project, agent, admin });
   const sql = `
-    SELECT m.id, m.scope, m.agent, m.key, m.value, m.outcome, m.times_recalled, m.created_at, m.embedding
+    SELECT m.id, m.scope, m.agent, m.key, m.value, m.type, m.outcome, m.times_recalled, m.created_at, m.embedding
     FROM memory m
     WHERE (${visibility.sql}) AND m.embedding IS NOT NULL
   `;
@@ -329,6 +363,52 @@ function markOutcome({ id, outcome }) {
   return { ok: true };
 }
 
+// Fixes a stored entry in place instead of leaving the wrong text around and
+// remembering a corrected duplicate next to it. Clears the embedding so the
+// next recallHybrid() call re-embeds the corrected text via its existing
+// lazy-backfill path (see backfillEmbeddings) - correctMemory itself stays
+// sync so it doesn't need to load the embedding model.
+function correctMemory({ id, value }) {
+  const info = db.prepare('UPDATE memory SET value = ?, embedding = NULL, updated_at = ? WHERE id = ?')
+    .run(value, Date.now(), id);
+  return { ok: info.changes > 0 };
+}
+
+// Explicit "this is still true/relevant" signal, distinct from the implicit
+// touchRows() bump that recall()/recallHybrid() do on every hit. Also resets
+// updated_at (recall hits don't), so decay_score treats it as freshly
+// confirmed rather than just counted.
+function touchMemory(id) {
+  const info = db.prepare('UPDATE memory SET times_recalled = times_recalled + 1, updated_at = ? WHERE id = ?')
+    .run(Date.now(), id);
+  return { ok: info.changes > 0 };
+}
+
+// relation defaults to '' (not stored as NULL) so the UNIQUE(from_id, to_id,
+// relation) constraint actually catches repeat links - see table comment.
+function addLink({ fromId, toId, relation }) {
+  const info = db.prepare(`
+    INSERT OR IGNORE INTO memory_links (from_id, to_id, relation, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(fromId, toId, relation || '', Date.now());
+  return { ok: true, created: info.changes > 0 };
+}
+
+// Links are undirected for lookup purposes - a row shows up whether it was
+// stored as from_id or to_id - `direction` tells the caller which side this
+// entry was on, in case a relation label reads one way ("supersedes").
+function getLinks(id) {
+  return db.prepare(`
+    SELECT l.relation,
+           CASE WHEN l.from_id = ? THEN 'to' ELSE 'from' END AS direction,
+           m.id AS other_id, m.scope AS other_scope, m.agent AS other_agent, m.value AS other_value
+    FROM memory_links l
+    JOIN memory m ON m.id = (CASE WHEN l.from_id = ? THEN l.to_id ELSE l.from_id END)
+    WHERE l.from_id = ? OR l.to_id = ?
+    ORDER BY l.created_at DESC
+  `).all(id, id, id, id);
+}
+
 function stats({ project }) {
   const total = db.prepare('SELECT COUNT(*) as n FROM memory WHERE project = ?').get(project);
   const byScope = db.prepare('SELECT scope, COUNT(*) as n FROM memory WHERE project = ? GROUP BY scope').all(project);
@@ -371,6 +451,10 @@ module.exports = {
   embedText,
   embedAndStore,
   markOutcome,
+  correctMemory,
+  touchMemory,
+  addLink,
+  getLinks,
   stats,
   listAll,
   DB_PATH,

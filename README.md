@@ -2,7 +2,14 @@
 
 MCP server for personal + shared memory that works with any MCP-compatible agent (Claude Code, Cursor, Codex CLI, ...). Personal entries are visible only to the agent that wrote them; shared entries are visible to every agent connected to the same project. Search is hybrid — SQLite FTS5 keyword matching fused with local, offline semantic search (see below) — ranked by past outcome (`success`/`failure`) and recall count.
 
-Five MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `memory_stats`, `memory_recall_recent`.
+Nine MCP tools: `memory_remember`, `memory_recall`, `memory_mark_outcome`, `memory_stats`, `memory_recall_recent`, `memory_correct`, `memory_touch`, `memory_link`, `memory_convention`.
+
+## Correcting, confirming, linking, conventions
+
+- **`memory_correct`** fixes an existing entry's text in place (id from a prior recall) instead of leaving the wrong fact around and remembering a corrected duplicate next to it.
+- **`memory_touch`** confirms an entry is still true/relevant right now without changing its text - resets its recall-ranking freshness.
+- **`memory_link`** connects two entries with an optional relation label (e.g. `caused-by`, `supersedes`). Linked entries show up as indented `-> `/`<- ` lines under either entry whenever it's recalled.
+- **`memory_convention`** stores a project rule/standard (`type=convention`) instead of a one-off fact. Conventions always sort first in `memory_recall` and `memory_recall_recent`, regardless of recency or decay - they don't stop being true just because nobody hit them last week.
 
 ## Semantic recall
 
