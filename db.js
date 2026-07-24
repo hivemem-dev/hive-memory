@@ -442,15 +442,17 @@ function getReranker() {
   return rerankerPromise;
 }
 
-// Re-sorts `rows` by how well each one actually answers `query`, scored one
-// pair at a time (query, row.value) rather than by comparing two
-// pre-computed vectors - slower, but far more accurate at telling a real
-// answer apart from something merely topic-adjacent (see RERANKER_MODEL
-// comment for measured numbers). Returns rows unchanged, in their original
-// order, if the model can't load - reranking is a quality improvement on
-// top of recallHybrid's fused order, never a hard requirement for it.
-async function rerank(query, rows) {
-  if (rows.length === 0) return rows;
+// Scores each row against `query` one pair at a time (query, row.value)
+// rather than comparing two pre-computed vectors - slower, but far more
+// accurate at telling a real answer apart from something merely
+// topic-adjacent (see RERANKER_MODEL comment for measured numbers). Returns
+// `rows` unscored, in their original order, if the model can't load -
+// reranking is a quality improvement on top of recallHybrid's fused order,
+// never a hard requirement for it. score is null in that fallback case -
+// callers that blend this with another signal (see recallHybrid) must
+// treat null as "no reranker opinion", not as a score of zero.
+async function rerankScored(query, rows) {
+  if (rows.length === 0) return [];
   try {
     const [tokenizer, model] = await getReranker();
     const scored = [];
@@ -460,11 +462,18 @@ async function rerank(query, rows) {
       scored.push({ row, score: logits.data[0] });
     }
     scored.sort((a, b) => b.score - a.score);
-    return scored.map(s => s.row);
+    return scored;
   } catch (err) {
     console.error('hive-memory: reranker unavailable, keeping fused search order:', err.message);
-    return rows;
+    return rows.map(row => ({ row, score: null }));
   }
+}
+
+// Thin convenience wrapper over rerankScored() for callers that only want
+// the reordered rows, not the raw scores.
+async function rerank(query, rows) {
+  const scored = await rerankScored(query, rows);
+  return scored.map(s => s.row);
 }
 
 // Combines keyword search (FTS5) with meaning-based search (local embedding
@@ -474,9 +483,11 @@ async function rerank(query, rows) {
 // embedding model can't load - never hard-fails a search over it. The fused
 // pool is then reranked (see rerank() above) before being cut down to
 // `limit` - fusion picks a rough top pool fast, the reranker picks the best
-// few out of that pool carefully.
-// skipRerank is a diagnostic escape hatch (used by cli.js verify --stage),
-// not something normal callers should pass - it answers "did the fast rough
+// few out of that pool carefully (see the comment inside this function for
+// why the reranker's order is used as-is, not blended with fusion's score).
+// skipRerank is a diagnostic escape hatch (used by this file's own offline
+// diagnostics, not exposed via any cli.js flag today), not something normal
+// callers should pass - it answers "did the fast rough
 // sort even pick this up" separately from "did the careful second pass rank
 // it highly", without paying the reranker's per-candidate cost.
 async function recallHybrid({ query, project, scope, agent, limit = 10, admin = false, skipRerank = false }) {
@@ -503,6 +514,17 @@ async function recallHybrid({ query, project, scope, agent, limit = 10, admin = 
   });
 
   const pool = [...fused.values()].sort((a, b) => b.score - a.score).slice(0, poolSize).map(m => m.row);
+  // Tried blending the reranker's cross-encoder score with the fusion (RRF)
+  // score instead of trusting the reranker's order outright (min-max
+  // normalizing both to [0,1] and combining with various weights) - measured
+  // via node cli.js verify against this installation's real history, every
+  // weight tested (0.1 through 0.9) matched or underperformed the reranker's
+  // own order alone. The reranker, even though its order looks erratic on
+  // individual misses (it sometimes drops fusion's #1 candidate entirely and
+  // separately rescues candidates from deep in the fusion pool), is simply a
+  // stronger signal than fusion's RRF score here - blending in a weaker
+  // signal can only pull correct answers down, not up. Kept as plain
+  // rerank(), not blendRerankWithFusion().
   const reranked = skipRerank ? pool : await rerank(query, pool);
   const rows = reranked.slice(0, limit);
   touchRows(rows.map(r => r.id));
@@ -798,6 +820,7 @@ module.exports = {
   embedText,
   embedAndStore,
   rerank,
+  rerankScored,
   markOutcome,
   correctMemory,
   touchMemory,
