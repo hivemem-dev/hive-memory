@@ -732,16 +732,36 @@ function extractQaFixtures({ project, agent, sampleSize = 20 }) {
   return fixtures;
 }
 
+// A hand-distilled fact (see memory_remember) can legitimately take the
+// answer row's place in the top-K: it's the same knowledge, just compressed
+// and cleaned up, and it's exactly what recall *should* surface once a raw
+// answer has been distilled. Without this, verifyRetrieval would count that
+// as a miss even though the right information was found - penalizing the
+// distillation workflow for doing its job. relation = 'distills' is the
+// convention used when memory_link records that a fact was extracted from a
+// raw answer (fromId = fact, toId = raw answer); checked in both directions
+// since links are stored undirected in practice (see memory_links comment).
+function distilledLinkIds(answerId) {
+  return db.prepare(`
+    SELECT from_id AS id FROM memory_links WHERE to_id = ? AND relation = 'distills'
+    UNION
+    SELECT to_id AS id FROM memory_links WHERE from_id = ? AND relation = 'distills'
+  `).all(answerId, answerId).map(r => r.id);
+}
+
 // For each fixture, re-asks the question text as a memory_recall query and
-// checks whether the matching answer row comes back in the top K - both via
-// the real hybrid search (query-aware) and via plain recallRecent
-// (chronological dump, no query awareness - the closest thing to "no real
-// retrieval, just skim what's recent"). The gap between the two numbers is
-// what query-aware recall is actually buying over a bare recent-N log.
+// checks whether the matching answer row (or a fact distilled from it, see
+// distilledLinkIds above) comes back in the top K - both via the real hybrid
+// search (query-aware) and via plain recallRecent (chronological dump, no
+// query awareness - the closest thing to "no real retrieval, just skim
+// what's recent"). The gap between the two numbers is what query-aware
+// recall is actually buying over a bare recent-N log.
 async function verifyRetrieval({ project, agent, sampleSize = 20, k = 5 }) {
   const fixtures = extractQaFixtures({ project, agent, sampleSize });
   const results = [];
   for (const f of fixtures) {
+    const matchIds = new Set([f.answerId, ...distilledLinkIds(f.answerId)]);
+
     // Pull a wider pool than k so answersOnlyHit (below) can re-rank within
     // it - the raw top-k is dominated by other UserPromptSubmit rows that
     // are textually similar to the query (a re-asked question looks most
@@ -750,14 +770,18 @@ async function verifyRetrieval({ project, agent, sampleSize = 20, k = 5 }) {
     // versus "answer just isn't findable at all".
     const pool = await recallHybrid({ query: f.question, project, agent, limit: Math.max(k * 6, 30), admin: false, scope: undefined });
     const hybridRows = pool.slice(0, k);
-    const hybridHit = hybridRows.some(r => r.id === f.answerId);
-    const hybridRank = hybridRows.findIndex(r => r.id === f.answerId);
+    const hybridRank = hybridRows.findIndex(r => matchIds.has(r.id));
+    const hybridHit = hybridRank !== -1;
 
-    const answersOnly = pool.filter(r => r.key === 'Stop').slice(0, k);
-    const answersOnlyHit = answersOnly.some(r => r.id === f.answerId);
+    // A distilled fact isn't a 'Stop' row (it's key = NULL, type = 'fact'),
+    // so it has to be let through this filter explicitly alongside the raw
+    // answer, or a distilled-fact hit would vanish from this diagnostic even
+    // though it counts as a hybridHit above.
+    const answersOnly = pool.filter(r => r.key === 'Stop' || matchIds.has(r.id)).slice(0, k);
+    const answersOnlyHit = answersOnly.some(r => matchIds.has(r.id));
 
     const recentRows = recallRecent({ project, agent, limit: k });
-    const recentHit = recentRows.some(r => r.id === f.answerId);
+    const recentHit = recentRows.some(r => matchIds.has(r.id));
 
     results.push({ ...f, hybridHit, hybridRank: hybridHit ? hybridRank + 1 : null, answersOnlyHit, recentHit });
   }
@@ -835,6 +859,7 @@ module.exports = {
   premortem,
   extractQaFixtures,
   verifyRetrieval,
+  distilledLinkIds,
   stats,
   listAll,
   DB_PATH,

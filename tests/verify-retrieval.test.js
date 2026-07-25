@@ -15,7 +15,7 @@ const fs = require('node:fs');
 const dbPath = path.join(os.tmpdir(), `hive-memory-verify-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
 process.env.HIVE_MEMORY_DB = dbPath;
 
-const { remember, extractQaFixtures, verifyRetrieval } = require('../db.js');
+const { remember, extractQaFixtures, verifyRetrieval, addLink } = require('../db.js');
 
 const project = '/verify-test-project';
 const agent = 'claude-code';
@@ -81,6 +81,35 @@ test('verifyRetrieval: a question sharing keywords with its answer is found; a n
 
   for (const suffix of ['', '-wal', '-shm']) {
     try { fs.unlinkSync(dbPath3 + suffix); } catch { /* ignore */ }
+  }
+  process.env.HIVE_MEMORY_DB = dbPath;
+  delete require.cache[require.resolve('../db.js')];
+});
+
+test('verifyRetrieval: a distilled fact linked to the raw answer (relation "distills") counts as a hit in its place', async () => {
+  const dbPath4 = path.join(os.tmpdir(), `hive-memory-verify-test4-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  process.env.HIVE_MEMORY_DB = dbPath4;
+  delete require.cache[require.resolve('../db.js')];
+  const freshDb = require('../db.js');
+  const p = '/verify-distill-test';
+
+  freshDb.remember({ scope: 'personal', agent, project: p, key: 'UserPromptSubmit', value: 'where does the zorbatron fallback config actually live on disk' });
+  const answer = freshDb.remember({ scope: 'personal', agent, project: p, key: 'Stop', value: 'The zorbatron fallback config lives in /etc/zorbatron/fallback.yaml, the old docs are wrong.' });
+  // A hand-distilled fact carrying the same knowledge, filed as a cleaner
+  // shared-scope row rather than the raw captured Stop text.
+  const fact = freshDb.remember({ scope: 'shared', agent, project: p, value: 'zorbatron fallback config path: /etc/zorbatron/fallback.yaml (not the old docs location).' });
+  freshDb.addLink({ fromId: fact.id, toId: answer.id, relation: 'distills' });
+
+  const report = await freshDb.verifyRetrieval({ project: p, agent, sampleSize: 10, k: 5 });
+  assert.equal(report.sampleSize, 1);
+  assert.equal(report.results[0].answerId, answer.id);
+  // Whichever of {raw answer, distilled fact} actually lands in the top-k,
+  // this must count as a hit - a fact standing in for its raw answer is the
+  // system working as intended, not a miss.
+  assert.equal(report.hybridRecall.hits, 1, 'a linked distilled fact taking the answer\'s slot must still count as a hit');
+
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.unlinkSync(dbPath4 + suffix); } catch { /* ignore */ }
   }
   process.env.HIVE_MEMORY_DB = dbPath;
   delete require.cache[require.resolve('../db.js')];
