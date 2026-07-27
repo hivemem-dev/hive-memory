@@ -328,6 +328,18 @@ function recall({ query, project, scope, agent, limit = 10, admin = false }) {
 // plain SELECT ordered by the same outcome/decay ranking, no FTS/MATCH
 // involved. Doesn't touch times_recalled - viewing the startup summary isn't
 // a real "recall" of a specific fact.
+//
+// Gotcha confirmed live 2026-07-27: a brand-new fact-type row defaults to
+// outcome='unknown', so it sorts BELOW every older row that happens to carry
+// outcome='success' - no matter how fresh, and even though decay_score alone
+// would rank it near the top (a never-recalled row still scores ~1, tying
+// with every other never-recalled row rather than winning on recency). A
+// freshly memory_remember()'d + memory_link()'d ('distills') summary did not
+// appear in the top 10 at all until memory_mark_outcome(id, 'success') was
+// called on it - then it jumped straight to #2. Any distillation workflow
+// (manual or the "systematic pass over history" idea in the retrieval-
+// quality writeup) must mark distilled facts success, not just link them,
+// or they're invisible to this no-query session-start path.
 function recallRecent({ project, agent, limit = 20 }) {
   const sql = `
     SELECT id, scope, agent, key, value, type, outcome, times_recalled, created_at

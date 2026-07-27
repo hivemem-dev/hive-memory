@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — documented a `memory_recall_recent` ranking gotcha (no code behavior change)
+
+- **Found and documented: freshly distilled facts were invisible to `memory_recall_recent` (the no-query, session-start path) until explicitly marked `success`.** `recallRecent()`'s `ORDER BY type = 'convention' DESC, outcome = 'success' DESC, decay_score(...) DESC` means a brand-new `fact`-type row (default `outcome='unknown'`) sorts below every older `outcome='success'` row regardless of recency - `decay_score` alone can't rescue it, since a never-recalled row only ever scores ~1 there. Verified live: a summary written via `memory_remember` + `memory_link(relation: 'distills')` didn't appear in the top 10 at all until `memory_mark_outcome(id, 'success')` was called, then it jumped to #2. No code changed (the tiered ranking is intentional design, not a bug) - added an explanatory comment at the `recallRecent()` call site so future distillation work (manual or the systematic full-history pass proposed in the 0.7.0-era retrieval-quality work) knows to mark distilled facts `success`, not just link them.
+
 ## 0.7.0 — reranker, query-clarity guidance, and fixed fixture pairing
 
 - **Added: reranker.** After keyword+semantic fusion produces a rough candidate pool, `tss-deposium/bge-reranker-v2-m3-onnx-int8` (~560MB, multilingual) scores the query against each candidate directly and re-sorts before cutting down to the requested limit. Falls back to the fusion order unchanged if it can't load.
